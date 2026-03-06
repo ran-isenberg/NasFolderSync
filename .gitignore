@@ -1,0 +1,31 @@
+# Build artifacts
+build/
+dist/
+*.spec.bak
+*.icns
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+
+# uv
+uv.lock
+
+# Testing & linting
+.pytest_cache/
+.ruff_cache/
+
+# IDE
+.vscode/
+.idea/
+
+# macOS
+.DS_Store
+
+# DMG output
+*.dmg
+
+# Iconset (generated during build)
+icon.iconset/

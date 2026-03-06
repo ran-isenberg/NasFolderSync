@@ -1,0 +1,24 @@
+.PHONY: install lint fmt test build deploy clean
+
+install:
+	uv sync
+
+lint:
+	uv run ruff check .
+	uv run ruff format --check .
+
+fmt:
+	uv run ruff check --fix .
+	uv run ruff format .
+
+test:
+	uv run pytest -v
+
+build:
+	./build.sh
+
+deploy:
+	./build.sh --install
+
+clean:
+	rm -rf dist build __pycache__ .pytest_cache .ruff_cache *.egg-info
