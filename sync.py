@@ -32,7 +32,7 @@ DEFAULT_CONFIG = {
     'destination': '/Volumes/NAS',
     'interval_minutes': 5,
     'enabled': True,
-    'use_checksum': False,
+    'use_checksum': True,
 }
 
 # rclone --stats-one-line output patterns
@@ -125,17 +125,24 @@ def parse_stats_line(line: str, progress: SyncProgress) -> SyncProgress:
 
 def load_config(config_file: str = CONFIG_FILE) -> dict:
     if os.path.exists(config_file):
-        with open(config_file) as f:
-            return {**DEFAULT_CONFIG, **json.load(f)}
-    # First launch — create the config file with defaults
+        try:
+            with open(config_file) as f:
+                return {**DEFAULT_CONFIG, **json.load(f)}
+        except (json.JSONDecodeError, ValueError):
+            pass  # Corrupt file — fall through to recreate with defaults
+    # First launch or corrupt file — create the config file with defaults
     config = DEFAULT_CONFIG.copy()
     save_config(config, config_file)
     return config
 
 
 def save_config(config: dict, config_file: str = CONFIG_FILE) -> None:
-    with open(config_file, 'w') as f:
+    # Atomic write: write to temp file then rename, so a crash mid-write
+    # never leaves a corrupt/empty config file.
+    tmp_file = config_file + '.tmp'
+    with open(tmp_file, 'w') as f:
         json.dump(config, f, indent=2)
+    os.replace(tmp_file, config_file)
 
 
 def install_launchd_plist() -> bool:
@@ -200,14 +207,19 @@ def uninstall_app() -> list[str]:
 
 def load_history(history_file: str = HISTORY_FILE) -> list[dict]:
     if os.path.exists(history_file):
-        with open(history_file) as f:
-            return json.load(f)
+        try:
+            with open(history_file) as f:
+                return json.load(f)
+        except (json.JSONDecodeError, ValueError):
+            pass  # Corrupt file — return empty
     return []
 
 
 def save_history(history: list[dict], history_file: str = HISTORY_FILE) -> None:
-    with open(history_file, 'w') as f:
+    tmp_file = history_file + '.tmp'
+    with open(tmp_file, 'w') as f:
         json.dump(history[-MAX_HISTORY:], f, indent=2)
+    os.replace(tmp_file, history_file)
 
 
 def add_history_entry(result: SyncResult, history_file: str = HISTORY_FILE) -> None:

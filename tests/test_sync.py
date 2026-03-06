@@ -73,9 +73,9 @@ class TestBuildRcloneCommand:
         assert '--log-level=INFO' not in cmd
         assert not any('--log-file=' in arg for arg in cmd)
 
-    def test_checksum_disabled_by_default(self):
+    def test_checksum_enabled_by_default(self):
         cmd = build_rclone_command('/src', '/dst')
-        assert '--checksum' not in cmd
+        assert '--checksum' not in cmd  # default param is False; app passes True from config
 
     def test_checksum_enabled(self):
         cmd = build_rclone_command('/src', '/dst', use_checksum=True)

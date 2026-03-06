@@ -7,7 +7,6 @@ from datetime import datetime, timedelta
 import objc
 import rumps
 from AppKit import NSURL, NSOpenPanel
-from PyObjCTools import AppHelper
 
 from sync import (
     APP_AUTHOR,
@@ -65,6 +64,10 @@ class FolderSyncApp(rumps.App):
         self._rclone_proc = None  # track rclone subprocess for force-kill on quit
         self.progress = SyncProgress()
 
+        # Flags set by background threads, consumed by UI timer on main thread
+        self._ui_dirty = True
+        self._rebuild_history = False
+
         # Menu items
         self.status_item = rumps.MenuItem('Status: Idle')
         self.status_item.set_callback(None)
@@ -107,14 +110,11 @@ class FolderSyncApp(rumps.App):
         self.source_item = rumps.MenuItem(f'Source: {self.config["source"]}', callback=self.set_source)
         self.dest_item = rumps.MenuItem(f'Destination: {self.config["destination"]}', callback=self.set_destination)
         self.interval_item = rumps.MenuItem(f'Interval: {self.config["interval_minutes"]} min', callback=self.set_interval)
-        self.checksum_item = rumps.MenuItem('Use Checksum (slower, more accurate)', callback=self.toggle_checksum)
-        self.checksum_item.state = self.config.get('use_checksum', False)
         self.autostart_item = rumps.MenuItem('Start on Login', callback=self.toggle_autostart)
         self.autostart_item.state = is_launchd_installed()
         self.configure_menu[self.source_item.title] = self.source_item
         self.configure_menu[self.dest_item.title] = self.dest_item
         self.configure_menu[self.interval_item.title] = self.interval_item
-        self.configure_menu[self.checksum_item.title] = self.checksum_item
         self.configure_menu[self.autostart_item.title] = self.autostart_item
 
         self.open_log_item = rumps.MenuItem('View Log', callback=self.open_log)
@@ -152,6 +152,11 @@ class FolderSyncApp(rumps.App):
             self.uninstall_item,
             self.quit_item,
         ]
+
+        # UI refresh timer — runs on the main thread, polls state set by background threads.
+        # This avoids calling AppKit from background threads (which causes crashes).
+        self._ui_timer = rumps.Timer(self._poll_ui, 1)
+        self._ui_timer.start()
 
         self._install_signal_handlers()
         if self.config['enabled']:
@@ -251,11 +256,15 @@ class FolderSyncApp(rumps.App):
             return f'{bytes_per_sec / 1024:.1f} KiB/s'
         return f'{bytes_per_sec:.0f} B/s'
 
-    def _update_progress_menu(self, progress: SyncProgress):
-        self.progress = progress
-        # Capture the initial total size on the first progress update
-        if progress.bytes_total and self._initial_bytes_total is None:
-            self._initial_bytes_total = progress.bytes_total
+    def _update_progress_menu(self):
+        """Update progress menu items from self.progress. Must be called on main thread."""
+        progress = self.progress
+        # Track the max total seen (total grows as rclone discovers more files during scan)
+        if progress.bytes_total:
+            if self._initial_bytes_total is None:
+                self._initial_bytes_total = progress.bytes_total
+            elif self._parse_bytes(progress.bytes_total) > self._parse_bytes(self._initial_bytes_total):
+                self._initial_bytes_total = progress.bytes_total
         if progress.bytes_transferred and self._initial_bytes_total:
             self.progress_data_item.title = f'Data: {progress.bytes_transferred} / {self._initial_bytes_total} ({progress.percent}%)'
         # Calculate speed and ETA from total transferred / elapsed time
@@ -278,8 +287,11 @@ class FolderSyncApp(rumps.App):
             if remaining_bytes > 0:
                 eta_seconds = int(remaining_bytes / bytes_per_sec)
                 self.progress_eta_item.title = f'ETA: {self._format_duration(eta_seconds)}'
-            else:
+            elif progress.percent >= 100:
                 self.progress_eta_item.title = 'ETA: done'
+            else:
+                # transferred >= tracked total but rclone still scanning/working
+                self.progress_eta_item.title = 'ETA: calculating...'
         else:
             self.progress_eta_item.title = 'ETA: —'
         if progress.current_file:
@@ -323,6 +335,22 @@ class FolderSyncApp(rumps.App):
         self.progress_eta_item.title = 'ETA: —'
         self.progress_current_item.title = 'File: —'
         self._initial_bytes_total = None
+
+    def _poll_ui(self, _):
+        """Called every second on the main thread by rumps.Timer. Safe to update UI here."""
+        if self._rebuild_history:
+            self._rebuild_history = False
+            self._rebuild_history_menu()
+
+        if self._ui_dirty:
+            self._ui_dirty = False
+            if self.status == 'syncing':
+                self._update_progress_menu()
+            self.update_menu()
+
+    def _mark_ui_dirty(self):
+        """Signal that UI needs refresh. Safe to call from any thread."""
+        self._ui_dirty = True
 
     # ── Sync loop ─────────────────────────────────────────────────────
 
@@ -389,7 +417,7 @@ class FolderSyncApp(rumps.App):
                 elapsed = (datetime.now() - self._sync_start_time).total_seconds() if self._sync_start_time else 0
                 remaining = max(0, interval - elapsed)
                 self._save_next_sync_time(datetime.now() + timedelta(seconds=remaining))
-                self._on_main_thread(self.update_menu)
+                self._mark_ui_dirty()
             else:
                 break  # timeout expired — time to sync
         return not self.stop_event.is_set()
@@ -398,7 +426,7 @@ class FolderSyncApp(rumps.App):
         # Check if we have a saved next_sync_time that hasn't passed yet
         if self._next_sync_time and self._next_sync_time > datetime.now():
             remaining = (self._next_sync_time - datetime.now()).total_seconds()
-            self._on_main_thread(self.update_menu)
+            self._mark_ui_dirty()
             if not self._wait_until_next_sync(remaining):
                 return  # stopped — keep saved next_sync_time for restart
         # Either no saved time, or it has passed — sync now
@@ -408,16 +436,12 @@ class FolderSyncApp(rumps.App):
             sync_duration = (datetime.now() - self._sync_start_time).total_seconds() if self._sync_start_time else 0
             remaining = max(0, interval - sync_duration)
             self._save_next_sync_time(datetime.now() + timedelta(seconds=remaining))
-            self._on_main_thread(self.update_menu)
+            self._mark_ui_dirty()
             if not self._wait_until_next_sync(remaining):
                 break  # stopped — keep saved next_sync_time for restart
             if self.config['enabled']:
                 self._save_next_sync_time(None)
                 self._run_sync()
-
-    def _on_main_thread(self, fn):
-        """Schedule fn to run on the main thread (required for UI updates)."""
-        AppHelper.callAfter(fn)
 
     def _run_sync(self):
         max_retries = 3
@@ -426,18 +450,21 @@ class FolderSyncApp(rumps.App):
 
         for attempt in range(1, max_retries + 1):
             self._sync_start_time = datetime.now()
+            self._initial_bytes_total = None
+            self.progress = SyncProgress()
             self.status = 'syncing'
-            self._on_main_thread(lambda: (self._reset_progress_menu(), self.update_menu()))
+            self._mark_ui_dirty()
 
             def _progress_callback(progress):
-                self._on_main_thread(lambda: self._update_progress_menu(progress))
+                self.progress = progress
+                self._mark_ui_dirty()
 
             result = run_sync_live(
                 self.config['source'],
                 self.config['destination'],
                 on_progress=_progress_callback,
                 stop_event=self.stop_event,
-                use_checksum=self.config.get('use_checksum', False),
+                use_checksum=self.config.get('use_checksum', True),
                 on_start=lambda proc: setattr(self, '_rclone_proc', proc),
             )
             self._rclone_proc = None
@@ -458,13 +485,14 @@ class FolderSyncApp(rumps.App):
                 # Transient error — retry after delay
                 self.status = 'error'
                 self.last_error = f'{result.error} (retry {attempt}/{max_retries})'
-                self._on_main_thread(self.update_menu)
+                self._mark_ui_dirty()
                 if self.stop_event.wait(timeout=retry_delay):
                     break  # stopped during retry wait
 
         if result.success or result.error != 'Sync cancelled':
             add_history_entry(result)
-        self._on_main_thread(lambda: (self._rebuild_history_menu(), self.update_menu()))
+        self._rebuild_history = True
+        self._mark_ui_dirty()
 
     # ── Signal handling ────────────────────────────────────────────────
 
@@ -541,13 +569,6 @@ class FolderSyncApp(rumps.App):
             except ValueError:
                 rumps.notification('FolderSync', 'Error', 'Please enter a valid number.', sound=False)
 
-    def toggle_checksum(self, _):
-        self.config['use_checksum'] = not self.config.get('use_checksum', False)
-        self.checksum_item.state = self.config['use_checksum']
-        save_config(self.config)
-        label = 'enabled' if self.config['use_checksum'] else 'disabled'
-        rumps.notification('FolderSync', 'Checksum mode', f'Checksum comparison {label}.', sound=False)
-
     def toggle_autostart(self, _):
         if is_launchd_installed():
             uninstall_launchd_plist()
@@ -583,6 +604,8 @@ class FolderSyncApp(rumps.App):
         """Stop sync and kill any running rclone subprocess."""
         self.stop_event.set()
         self._wake_event.set()
+        if self._ui_timer.is_alive():
+            self._ui_timer.stop()
         proc = self._rclone_proc
         if proc:
             try:

@@ -127,12 +127,12 @@ class TestUpdateMenuStates:
         """Create a FolderSyncApp with mocked rumps to avoid GUI initialization."""
         from app import FolderSyncApp
 
-        with patch('app.rumps'), patch('app.is_launchd_installed', return_value=False), patch('app.load_config', return_value={'source': '/src', 'destination': '/dst', 'interval_minutes': 5, 'enabled': True, 'use_checksum': False}), patch('app.load_history', return_value=[]), patch('app.find_rclone', return_value='/usr/bin/rclone'):
+        with patch('app.rumps'), patch('app.is_launchd_installed', return_value=False), patch('app.load_config', return_value={'source': '/src', 'destination': '/dst', 'interval_minutes': 5, 'enabled': True, 'use_checksum': True}), patch('app.load_history', return_value=[]), patch('app.find_rclone', return_value='/usr/bin/rclone'):
             # Mock rumps.App.__init__
             with patch.object(FolderSyncApp, '__init__', lambda self: None):
                 app = FolderSyncApp()
                 # Set up minimum required attributes
-                app.config = {'source': '/src', 'destination': '/dst', 'interval_minutes': 5, 'enabled': True, 'use_checksum': False}
+                app.config = {'source': '/src', 'destination': '/dst', 'interval_minutes': 5, 'enabled': True, 'use_checksum': True}
                 app.status = 'idle'
                 app.last_sync = None
                 app.last_error = None
@@ -208,7 +208,7 @@ class TestNextSyncTime:
 
         with patch.object(FolderSyncApp, '__init__', lambda self: None):
             app = FolderSyncApp()
-            app.config = {'source': '/src', 'destination': '/dst', 'interval_minutes': 5, 'enabled': True, 'use_checksum': False}
+            app.config = {'source': '/src', 'destination': '/dst', 'interval_minutes': 5, 'enabled': True, 'use_checksum': True}
             app.status = 'idle'
             app.last_sync = None
             app.last_error = None
@@ -261,7 +261,7 @@ class TestStatusDisplay:
 
         with patch.object(FolderSyncApp, '__init__', lambda self: None):
             app = FolderSyncApp()
-            app.config = {'source': '/src', 'destination': '/dst', 'interval_minutes': 5, 'enabled': True, 'use_checksum': False}
+            app.config = {'source': '/src', 'destination': '/dst', 'interval_minutes': 5, 'enabled': True, 'use_checksum': True}
             app.status = 'idle'
             app.last_sync = None
             app.last_error = None
@@ -325,7 +325,7 @@ class TestNextSyncTimePersistence:
 
         with patch.object(FolderSyncApp, '__init__', lambda self: None):
             app = FolderSyncApp()
-            app.config = {'source': '/src', 'destination': '/dst', 'interval_minutes': 5, 'enabled': True, 'use_checksum': False}
+            app.config = {'source': '/src', 'destination': '/dst', 'interval_minutes': 5, 'enabled': True, 'use_checksum': True}
             app.status = 'idle'
             app.last_sync = None
             app.last_error = None
@@ -407,7 +407,7 @@ class TestNextSyncTimePersistence:
 
         config_file = str(tmp_path / 'config.json')
         future = datetime(2026, 3, 7, 10, 30)
-        config = {'source': '/src', 'destination': '/dst', 'interval_minutes': 5, 'enabled': True, 'use_checksum': False, 'next_sync_time': future.isoformat()}
+        config = {'source': '/src', 'destination': '/dst', 'interval_minutes': 5, 'enabled': True, 'use_checksum': True, 'next_sync_time': future.isoformat()}
         save_config(config, config_file)
 
         loaded = load_config(config_file)
@@ -460,7 +460,7 @@ class TestNextSyncTimePersistence:
 
         config_file = str(tmp_path / 'config.json')
         future = datetime(2026, 3, 7, 10, 30)
-        config = {'source': '/src', 'destination': '/dst', 'interval_minutes': 5, 'enabled': True, 'use_checksum': False, 'next_sync_time': future.isoformat()}
+        config = {'source': '/src', 'destination': '/dst', 'interval_minutes': 5, 'enabled': True, 'use_checksum': True, 'next_sync_time': future.isoformat()}
         save_config(config, config_file)
 
         # Simulate quit: stop_event is set but config should still have next_sync_time
@@ -486,7 +486,7 @@ class TestNextSyncTimePersistence:
         future = datetime(2026, 3, 7, 14, 0)
 
         # App running: saves next sync time
-        config = {'source': '/src', 'destination': '/dst', 'interval_minutes': 5, 'enabled': True, 'use_checksum': False}
+        config = {'source': '/src', 'destination': '/dst', 'interval_minutes': 5, 'enabled': True, 'use_checksum': True}
         config['next_sync_time'] = future.isoformat()
         save_config(config, config_file)
 
