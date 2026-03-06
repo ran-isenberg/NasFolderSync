@@ -140,12 +140,12 @@ class TestCleanupAppData:
 
 class TestLaunchdPlist:
     def test_install_creates_plist(self, tmp_path):
-        app_path = tmp_path / 'UNasSync.app' / 'Contents' / 'MacOS'
+        app_path = tmp_path / 'NasFolderSync.app' / 'Contents' / 'MacOS'
         app_path.mkdir(parents=True)
         plist_path = str(tmp_path / 'com.user.unassync.plist')
 
         with (
-            patch('sync.APP_PATH', str(tmp_path / 'UNasSync.app')),
+            patch('sync.APP_PATH', str(tmp_path / 'NasFolderSync.app')),
             patch('sync.LAUNCHD_PLIST', plist_path),
             patch('sync.subprocess.run'),
         ):

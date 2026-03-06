@@ -3,7 +3,7 @@ set -e
 
 echo ""
 echo "╔══════════════════════════════════════╗"
-echo "║       UNasSync  Builder             ║"
+echo "║       NasFolderSync  Builder             ║"
 echo "╚══════════════════════════════════════╝"
 echo ""
 
@@ -53,13 +53,13 @@ fi
 
 # ── 7. Build the .app ─────────────────────────────────────────────────
 echo ""
-echo "🔨  Building UNasSync.app..."
-uv run pyinstaller UNasSync.spec --noconfirm --clean
+echo "🔨  Building NasFolderSync.app..."
+uv run pyinstaller NasFolderSync.spec --noconfirm --clean
 
-APP_SRC="dist/UNasSync.app"
+APP_SRC="dist/NasFolderSync.app"
 
 if [ ! -d "$APP_SRC" ]; then
-  echo "❌  Build failed — dist/UNasSync.app not found"
+  echo "❌  Build failed — dist/NasFolderSync.app not found"
   exit 1
 fi
 
@@ -107,11 +107,11 @@ for s in sizes:
 print("  PNG frames written")
 PYEOF
 
-iconutil -c icns "$ICON_DIR" -o UNasSync.icns 2>/dev/null || true
+iconutil -c icns "$ICON_DIR" -o NasFolderSync.icns 2>/dev/null || true
 
-if [ -f "UNasSync.icns" ]; then
-  cp UNasSync.icns "$APP_SRC/Contents/Resources/UNasSync.icns"
-  /usr/libexec/PlistBuddy -c "Set :CFBundleIconFile UNasSync" \
+if [ -f "NasFolderSync.icns" ]; then
+  cp NasFolderSync.icns "$APP_SRC/Contents/Resources/NasFolderSync.icns"
+  /usr/libexec/PlistBuddy -c "Set :CFBundleIconFile NasFolderSync" \
     "$APP_SRC/Contents/Info.plist" 2>/dev/null || true
   echo "✅  Icon applied"
 fi
@@ -120,26 +120,26 @@ rm -rf "$ICON_DIR"
 
 # ── 9. Build the DMG ──────────────────────────────────────────────────
 echo ""
-echo "💿  Building UNasSync.dmg..."
+echo "💿  Building NasFolderSync.dmg..."
 
-DMG_OUT="UNasSync.dmg"
+DMG_OUT="NasFolderSync.dmg"
 [ -f "$DMG_OUT" ] && rm "$DMG_OUT"
 
 create-dmg \
-  --volname "UNasSync" \
-  --volicon "UNasSync.icns" \
+  --volname "NasFolderSync" \
+  --volicon "NasFolderSync.icns" \
   --window-pos 200 120 \
   --window-size 560 340 \
   --icon-size 100 \
-  --icon "UNasSync.app" 140 170 \
-  --hide-extension "UNasSync.app" \
+  --icon "NasFolderSync.app" 140 170 \
+  --hide-extension "NasFolderSync.app" \
   --app-drop-link 420 170 \
   "$DMG_OUT" \
-  "dist/" \
+  "$APP_SRC" \
   || true  # exit 2 is normal when app is unsigned
 
 if [ -f "$DMG_OUT" ]; then
-  echo "✅  UNasSync.dmg created"
+  echo "✅  NasFolderSync.dmg created"
 else
   echo "⚠️  DMG not created — continuing with direct install"
 fi
@@ -147,7 +147,7 @@ fi
 # ── 10. Install & Launch (only with --install flag) ──────────────────
 if [ "${1:-}" = "--install" ]; then
   echo ""
-  APP_DST="/Applications/UNasSync.app"
+  APP_DST="/Applications/NasFolderSync.app"
 
   if [ -d "$APP_DST" ]; then
     echo "🗑   Removing old version..."
@@ -158,18 +158,18 @@ if [ "${1:-}" = "--install" ]; then
   echo "✅  Installed to /Applications"
 
   # Strip quarantine so Gatekeeper doesn't block first launch
-  xattr -rd com.apple.quarantine "/Applications/UNasSync.app" 2>/dev/null || true
+  xattr -rd com.apple.quarantine "/Applications/NasFolderSync.app" 2>/dev/null || true
 
   echo ""
-  echo "🚀  Launching UNasSync..."
-  open "/Applications/UNasSync.app"
+  echo "🚀  Launching NasFolderSync..."
+  open "/Applications/NasFolderSync.app"
 
   echo ""
   echo "╔══════════════════════════════════════════════════════════════╗"
   echo "║  ✅  Done!                                                    ║"
   echo "║                                                              ║"
   echo "║  • App running — look for ☁️  in your menu bar (top right)   ║"
-  echo "║  • UNasSync.dmg available in project directory              ║"
+  echo "║  • NasFolderSync.dmg available in project directory              ║"
   echo "║  • Click ☁️  → Configure to set your NAS path               ║"
   echo "╚══════════════════════════════════════════════════════════════╝"
   echo ""
@@ -178,8 +178,8 @@ else
   echo "╔══════════════════════════════════════════════════════════════╗"
   echo "║  ✅  Build complete!                                         ║"
   echo "║                                                              ║"
-  echo "║  • dist/UNasSync.app ready                                 ║"
-  echo "║  • UNasSync.dmg ready (if create-dmg succeeded)            ║"
+  echo "║  • dist/NasFolderSync.app ready                                 ║"
+  echo "║  • NasFolderSync.dmg ready (if create-dmg succeeded)            ║"
   echo "║                                                              ║"
   echo "║  Run './build.sh --install' to install & launch              ║"
   echo "╚══════════════════════════════════════════════════════════════╝"

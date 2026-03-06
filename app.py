@@ -39,9 +39,9 @@ def _pick_folder(title: str, start_path: str | None = None) -> str | None:
     return None
 
 
-class UNasSyncApp(rumps.App):
+class NasFolderSyncApp(rumps.App):
     def __init__(self):
-        super().__init__('UNasSync', quit_button=None)
+        super().__init__('NasFolderSync', quit_button=None)
         self.config = load_config()
 
         self.status = 'idle'
@@ -277,7 +277,7 @@ class UNasSyncApp(rumps.App):
     def _save_and_restart(self):
         save_config(self.config)
         self._update_config_menu()
-        rumps.notification('UNasSync', 'Config saved', 'Settings updated. Restarting sync loop.', sound=False)
+        rumps.notification('NasFolderSync', 'Config saved', 'Settings updated. Restarting sync loop.', sound=False)
         self.stop_event.set()
         if self.config['enabled']:
             time.sleep(0.5)
@@ -314,41 +314,41 @@ class UNasSyncApp(rumps.App):
             try:
                 minutes = int(response.text.strip())
                 if minutes < 1:
-                    rumps.notification('UNasSync', 'Error', 'Interval must be at least 1 minute.', sound=False)
+                    rumps.notification('NasFolderSync', 'Error', 'Interval must be at least 1 minute.', sound=False)
                     return
                 self.config['interval_minutes'] = minutes
                 self._save_and_restart()
             except ValueError:
-                rumps.notification('UNasSync', 'Error', 'Please enter a valid number.', sound=False)
+                rumps.notification('NasFolderSync', 'Error', 'Please enter a valid number.', sound=False)
 
     def toggle_checksum(self, _):
         self.config['use_checksum'] = not self.config.get('use_checksum', False)
         self.checksum_item.state = self.config['use_checksum']
         save_config(self.config)
         label = 'enabled' if self.config['use_checksum'] else 'disabled'
-        rumps.notification('UNasSync', 'Checksum mode', f'Checksum comparison {label}.', sound=False)
+        rumps.notification('NasFolderSync', 'Checksum mode', f'Checksum comparison {label}.', sound=False)
 
     def toggle_autostart(self, _):
         if is_launchd_installed():
             uninstall_launchd_plist()
             self.autostart_item.state = False
-            rumps.notification('UNasSync', 'Auto-start disabled', 'App will no longer start on login.', sound=False)
+            rumps.notification('NasFolderSync', 'Auto-start disabled', 'App will no longer start on login.', sound=False)
         elif install_launchd_plist():
             self.autostart_item.state = True
-            rumps.notification('UNasSync', 'Auto-start enabled', 'App will start automatically on login.', sound=False)
+            rumps.notification('NasFolderSync', 'Auto-start enabled', 'App will start automatically on login.', sound=False)
         else:
-            rumps.notification('UNasSync', 'Error', 'App not found in /Applications. Install first.', sound=False)
+            rumps.notification('NasFolderSync', 'Error', 'App not found in /Applications. Install first.', sound=False)
 
     def open_log(self, _):
         log = os.path.expanduser('~/unassync.log')
         if os.path.exists(log):
             subprocess.Popen(['open', '-a', 'Console', log])
         else:
-            rumps.notification('UNasSync', 'No log yet', 'Run a sync first.', sound=False)
+            rumps.notification('NasFolderSync', 'No log yet', 'Run a sync first.', sound=False)
 
     def uninstall(self, _):
         response = rumps.alert(
-            title='Uninstall UNasSync',
+            title='Uninstall NasFolderSync',
             message='This will remove the app, config, history, and log files.\nYour Google Drive and NAS folders will NOT be touched.',
             ok='Uninstall',
             cancel='Cancel',
@@ -356,7 +356,7 @@ class UNasSyncApp(rumps.App):
         if response == 1:
             self.stop_event.set()
             removed = uninstall_app()
-            rumps.notification('UNasSync', 'Uninstalled', f'Removed {len(removed)} items. Goodbye!', sound=False)
+            rumps.notification('NasFolderSync', 'Uninstalled', f'Removed {len(removed)} items. Goodbye!', sound=False)
             rumps.quit_application()
 
     def quit_app(self, _):
@@ -365,4 +365,4 @@ class UNasSyncApp(rumps.App):
 
 
 if __name__ == '__main__':
-    UNasSyncApp().run()
+    NasFolderSyncApp().run()

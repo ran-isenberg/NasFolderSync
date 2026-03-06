@@ -1,4 +1,4 @@
-# UNasSync — macOS Menu Bar App
+# NasFolderSync — macOS Menu Bar App
 
 A macOS menu bar application that automatically syncs your Google Drive to a NAS (or any local/network folder) using [rclone](https://rclone.org/). Built with Python, [rumps](https://github.com/jaredks/rumps), and PyInstaller.
 
@@ -24,7 +24,7 @@ A macOS menu bar application that automatically syncs your Google Drive to a NAS
 ```
 ┌─────────────────────────────────────────────────────┐
 │                    Menu Bar (rumps)                  │
-│  app.py — UNasSyncApp                               │
+│  app.py — NasFolderSyncApp                               │
 │  ┌───────────┐ ┌──────────┐ ┌────────────────────┐  │
 │  │  Status   │ │ Progress │ │ Recent Syncs       │  │
 │  │  ☁️ / 🔄  │ │ Data/ETA │ │ ✅ Mar 05, 10:00   │  │
@@ -91,7 +91,7 @@ gdrive-nas-sync/
 ├── pyproject.toml      # Project config (uv, ruff, pytest)
 ├── Makefile            # Dev commands: install, lint, fmt, test, build, deploy
 ├── build.sh            # Build .app + .dmg, optional install
-├── UNasSync.spec       # PyInstaller spec for macOS .app bundle
+├── NasFolderSync.spec       # PyInstaller spec for macOS .app bundle
 ├── .python-version     # Python 3.14
 └── README.md
 ```
@@ -117,7 +117,7 @@ chmod +x build.sh
 ./build.sh
 ```
 
-This installs `rclone`, `uv`, Python dependencies, builds `UNasSync.app` and a `.dmg` installer.
+This installs `rclone`, `uv`, Python dependencies, builds `NasFolderSync.app` and a `.dmg` installer.
 
 ### Install and launch
 
@@ -192,7 +192,7 @@ Config is stored at `~/.unassync.json`.
 ## Auto-start on login
 
 1. Open **System Settings → General → Login Items**
-2. Click **+** and add `/Applications/UNasSync.app`
+2. Click **+** and add `/Applications/NasFolderSync.app`
 
 ---
 
@@ -215,5 +215,5 @@ All removed on uninstall. Your Google Drive and NAS folders are **never** modifi
 | ⚠️ "Google Drive not mounted" | Make sure Google Drive for Desktop is running |
 | ⚠️ "NAS not mounted" | Reconnect via Finder → Go → Connect to Server |
 | ⚠️ "rclone not found" | Run `brew install rclone` in Terminal |
-| App doesn't appear | Check `/Applications/UNasSync.app` exists, try opening manually |
+| App doesn't appear | Check `/Applications/NasFolderSync.app` exists, try opening manually |
 | Sync is slow | Check network speed; adjust `--transfers` and `--checkers` in `sync.py` |

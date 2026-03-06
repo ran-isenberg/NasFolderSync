@@ -1,7 +1,7 @@
 [project]
 name = "unassync"
 version = "1.0.0"
-description = "UNasSync — macOS menu bar app that syncs Google Drive to a NAS via rclone"
+description = "NasFolderSync — macOS menu bar app that syncs Google Drive to a NAS via rclone"
 requires-python = ">=3.14"
 dependencies = [
     "rumps>=0.4.0",

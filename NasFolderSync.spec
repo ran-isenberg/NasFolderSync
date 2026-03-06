@@ -25,7 +25,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='UNasSync',
+    name='NasFolderSync',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -41,12 +41,12 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='UNasSync',
+    name='NasFolderSync',
 )
 
 app = BUNDLE(
     coll,
-    name='UNasSync.app',
+    name='NasFolderSync.app',
     icon=None,
     bundle_identifier='com.user.unassync',
     info_plist={
@@ -54,6 +54,6 @@ app = BUNDLE(
         'NSHighResolutionCapable': True,
         'CFBundleShortVersionString': '1.0.0',
         'LSMinimumSystemVersion': '13.0',
-        'NSAppleEventsUsageDescription': 'UNasSync needs access to run rclone.',
+        'NSAppleEventsUsageDescription': 'NasFolderSync needs access to run rclone.',
     },
 )

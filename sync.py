@@ -11,7 +11,7 @@ from datetime import datetime
 CONFIG_FILE = os.path.expanduser('~/.unassync.json')
 HISTORY_FILE = os.path.expanduser('~/.unassync-history.json')
 LOG_FILE = os.path.expanduser('~/unassync.log')
-APP_PATH = '/Applications/UNasSync.app'
+APP_PATH = '/Applications/NasFolderSync.app'
 MAX_HISTORY = 20
 
 LAUNCHD_LABEL = 'com.user.unassync'
@@ -115,7 +115,7 @@ def install_launchd_plist() -> bool:
 
     plist = {
         'Label': LAUNCHD_LABEL,
-        'ProgramArguments': [os.path.join(APP_PATH, 'Contents', 'MacOS', 'UNasSync')],
+        'ProgramArguments': [os.path.join(APP_PATH, 'Contents', 'MacOS', 'NasFolderSync')],
         'RunAtLoad': True,
         'KeepAlive': False,
     }
