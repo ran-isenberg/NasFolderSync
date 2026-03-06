@@ -4,17 +4,27 @@ import plistlib
 import re
 import shutil
 import subprocess
+import sys
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 
-CONFIG_FILE = os.path.expanduser('~/.unassync.json')
-HISTORY_FILE = os.path.expanduser('~/.unassync-history.json')
-LOG_FILE = os.path.expanduser('~/unassync.log')
-APP_PATH = '/Applications/NasFolderSync.app'
-MAX_HISTORY = 20
+APP_VERSION = '1.0.0'
+APP_BUILD_TIME = 'dev'  # stamped by build.sh
+APP_BUILD_HASH = 'dev'  # stamped by build.sh
+APP_AUTHOR = 'Ran Isenberg'
+APP_WEBSITE = 'https://www.ranthebuilder.cloud'
+APP_SPONSOR = 'https://github.com/sponsors/ran-isenberg'
 
-LAUNCHD_LABEL = 'com.user.unassync'
+CONFIG_FILE = os.path.expanduser('~/.foldersync.json')
+HISTORY_FILE = os.path.expanduser('~/.foldersync-history.json')
+LOG_FILE = os.path.expanduser('~/foldersync.log')
+APP_PATH = '/Applications/FolderSync.app'
+MAX_HISTORY = 20
+MAX_LOG_BYTES = 512 * 1024  # 512 KB — keep log file from growing unbounded
+
+LAUNCHD_LABEL = 'com.ranthebuilder.foldersync'
 LAUNCHD_PLIST = os.path.expanduser(f'~/Library/LaunchAgents/{LAUNCHD_LABEL}.plist')
 
 DEFAULT_CONFIG = {
@@ -26,20 +36,27 @@ DEFAULT_CONFIG = {
 }
 
 # rclone --stats-one-line output patterns
-# "Transferred:   1.234 GiB / 5.678 GiB, 22%, 10.5 MiB/s, ETA 5m30s"
+# With --progress: "Transferred:   1.234 GiB / 5.678 GiB, 22%, 10.5 MiB/s, ETA 5m30s"
+# Without (piped): "    1.234 GiB / 5.678 GiB, 22%, 10.5 MiB/s, ETA 5m30s"
 _RE_TRANSFER_STATS = re.compile(
-    r'Transferred:\s+'
+    r'(?:Transferred:\s+)?'
     r'(?P<transferred>[\d.]+ \S+)\s*/\s*(?P<total>[\d.]+ \S+),\s*'
     r'(?P<percent>\d+)%'
     r'(?:,\s*(?P<speed>[\d.]+ \S+/s))?'
     r'(?:,\s*ETA\s*(?P<eta>\S+))?'
 )
 
-# "Transferred:   10 / 50, 20%"
-_RE_FILE_STATS = re.compile(r'Transferred:\s+(?P<done>\d+)\s*/\s*(?P<total>\d+),\s*(?P<percent>\d+)%')
+# "Transferred:   10 / 50, 20%" or "10 / 50, 20%"
+_RE_FILE_STATS = re.compile(r'(?:Transferred:\s+)?(?P<done>\d+)\s*/\s*(?P<total>\d+),\s*(?P<percent>\d+)%')
 
 # "Transferring:\n *  filename.ext: 22% /1.2Mi, 500Ki/s, 1s"
 _RE_CURRENT_FILE = re.compile(r'^\s*\*\s+(?P<name>.+?):\s*(?P<detail>.+)$')
+
+# rclone -v INFO line: "2026/03/06 17:45:33 INFO  : file.txt: Copied (server-side copy)"
+_RE_INFO_FILE = re.compile(r'INFO\s*:\s*(?P<name>.+?):\s*(?P<detail>Copied|Moved|Deleted|Updated|Unchanged|Skipped)')
+
+# Log prefix pattern: "2026/03/06 17:45:33 NOTICE: " or "2026/03/06 17:45:33 INFO  : "
+_RE_LOG_PREFIX = re.compile(r'^\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2}\s+\w+\s*:\s*')
 
 
 @dataclass
@@ -67,8 +84,11 @@ class SyncResult:
 
 def parse_stats_line(line: str, progress: SyncProgress) -> SyncProgress:
     """Parse a single line of rclone --stats output and update progress in-place."""
+    # Strip rclone log prefix (timestamp + level) if present
+    stripped = _RE_LOG_PREFIX.sub('', line)
+
     # Try data transfer stats first (more specific pattern)
-    m = _RE_TRANSFER_STATS.search(line)
+    m = _RE_TRANSFER_STATS.search(stripped)
     if m:
         progress.bytes_transferred = m.group('transferred')
         progress.bytes_total = m.group('total')
@@ -80,14 +100,21 @@ def parse_stats_line(line: str, progress: SyncProgress) -> SyncProgress:
         return progress
 
     # Try file count stats
-    m = _RE_FILE_STATS.search(line)
+    m = _RE_FILE_STATS.search(stripped)
     if m:
         progress.files_done = int(m.group('done'))
         progress.files_total = int(m.group('total'))
         return progress
 
-    # Try current file
-    m = _RE_CURRENT_FILE.search(line)
+    # Try current file (from --progress output)
+    m = _RE_CURRENT_FILE.search(stripped)
+    if m:
+        progress.current_file = m.group('name')
+        progress.current_file_detail = m.group('detail')
+        return progress
+
+    # Try INFO file activity (from -v output)
+    m = _RE_INFO_FILE.search(line)
     if m:
         progress.current_file = m.group('name')
         progress.current_file_detail = m.group('detail')
@@ -100,7 +127,10 @@ def load_config(config_file: str = CONFIG_FILE) -> dict:
     if os.path.exists(config_file):
         with open(config_file) as f:
             return {**DEFAULT_CONFIG, **json.load(f)}
-    return DEFAULT_CONFIG.copy()
+    # First launch — create the config file with defaults
+    config = DEFAULT_CONFIG.copy()
+    save_config(config, config_file)
+    return config
 
 
 def save_config(config: dict, config_file: str = CONFIG_FILE) -> None:
@@ -115,7 +145,7 @@ def install_launchd_plist() -> bool:
 
     plist = {
         'Label': LAUNCHD_LABEL,
-        'ProgramArguments': [os.path.join(APP_PATH, 'Contents', 'MacOS', 'NasFolderSync')],
+        'ProgramArguments': [os.path.join(APP_PATH, 'Contents', 'MacOS', 'FolderSync')],
         'RunAtLoad': True,
         'KeepAlive': False,
     }
@@ -195,6 +225,21 @@ def add_history_entry(result: SyncResult, history_file: str = HISTORY_FILE) -> N
     save_history(history, history_file)
 
 
+def truncate_log(log_file: str = LOG_FILE, max_bytes: int = MAX_LOG_BYTES) -> None:
+    """Truncate the log file to approximately max_bytes, keeping the tail."""
+    if not os.path.exists(log_file):
+        return
+    size = os.path.getsize(log_file)
+    if size <= max_bytes:
+        return
+    with open(log_file, 'rb') as f:
+        f.seek(size - max_bytes)
+        f.readline()  # skip partial first line
+        tail = f.read()
+    with open(log_file, 'wb') as f:
+        f.write(tail)
+
+
 def validate_paths(source: str, destination: str) -> str | None:
     """Return an error message if paths are invalid, None if OK."""
     if not os.path.isdir(source):
@@ -204,22 +249,70 @@ def validate_paths(source: str, destination: str) -> str | None:
     return None
 
 
-def build_rclone_command(source: str, destination: str, log_file: str | None = None, use_checksum: bool = False) -> list[str]:
+def find_rclone() -> str | None:
+    """Find the rclone binary, checking the app bundle first, then common paths."""
+    # Check inside the .app bundle (Contents/Resources/rclone next to Contents/MacOS/)
+    if getattr(sys, 'frozen', False):
+        bundle_rclone = os.path.join(os.path.dirname(sys.executable), '..', 'Resources', 'rclone')
+        bundle_rclone = os.path.normpath(bundle_rclone)
+        if os.path.isfile(bundle_rclone) and os.access(bundle_rclone, os.X_OK):
+            return bundle_rclone
+
+    path = shutil.which('rclone')
+    if path:
+        return path
+    for candidate in ['/opt/homebrew/bin/rclone', '/usr/local/bin/rclone', '/usr/bin/rclone']:
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return None
+
+
+def install_rclone() -> str | None:
+    """Attempt to install rclone via Homebrew. Returns the path if successful, None otherwise."""
+    # Try Homebrew first
+    brew_paths = ['/opt/homebrew/bin/brew', '/usr/local/bin/brew']
+    brew = None
+    for candidate in brew_paths:
+        if os.path.isfile(candidate):
+            brew = candidate
+            break
+    if not brew:
+        brew = shutil.which('brew')
+
+    if brew:
+        try:
+            result = subprocess.run([brew, 'install', 'rclone'], capture_output=True, text=True, timeout=300, check=False)
+            if result.returncode == 0:
+                return find_rclone()
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+
+    return None
+
+
+def build_rclone_command(source: str, destination: str, log_file: str | None = None, use_checksum: bool = False, live: bool = False) -> list[str]:
     if log_file is None:
-        log_file = os.path.expanduser('~/unassync.log')
+        log_file = os.path.expanduser('~/foldersync.log')
+    rclone_bin = find_rclone()
+    if not rclone_bin:
+        raise FileNotFoundError('rclone not found — run: brew install rclone')
     cmd = [
-        'rclone',
+        rclone_bin,
         'sync',
         source,
         destination,
         '--transfers=4',
         '--checkers=8',
-        f'--log-file={log_file}',
-        '--log-level=INFO',
         '--stats=1s',
         '--stats-one-line',
-        '--progress',
     ]
+    if live:
+        # In live mode, output goes to stderr so we can parse progress.
+        # We write to the log file ourselves.
+        cmd += ['-v']
+    else:
+        # In non-live mode, rclone writes directly to the log file.
+        cmd += [f'--log-file={log_file}', '--log-level=INFO', '--stats-log-level=NOTICE']
     if use_checksum:
         cmd.append('--checksum')
     return cmd
@@ -256,6 +349,7 @@ def run_sync_live(
     stop_event=None,
     log_file: str | None = None,
     use_checksum: bool = False,
+    on_start: Callable[[subprocess.Popen], None] | None = None,
 ) -> SyncResult:
     """Run rclone sync with real-time progress updates via callback."""
     path_error = validate_paths(source, destination)
@@ -266,34 +360,58 @@ def run_sync_live(
             error=path_error,
         )
 
-    cmd = build_rclone_command(source, destination, log_file, use_checksum=use_checksum)
+    if log_file is None:
+        log_file = os.path.expanduser('~/foldersync.log')
+    truncate_log(log_file)
+    cmd = build_rclone_command(source, destination, log_file, use_checksum=use_checksum, live=True)
     progress = SyncProgress()
     start_time = datetime.now()
+    cancelled = False
+
+    def _kill_on_stop(proc, event):
+        """Watch stop_event and terminate rclone immediately when set."""
+        event.wait()
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        except OSError:
+            pass
 
     try:
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        if on_start:
+            on_start(proc)
+        log_fh = open(log_file, 'a')  # noqa: SIM115
 
-        # Read stderr for progress (rclone writes stats to stderr)
-        while True:
-            if stop_event and stop_event.is_set():
-                proc.terminate()
-                proc.wait(timeout=5)
-                return SyncResult(
-                    timestamp=datetime.now().strftime('%b %d, %H:%M'),
-                    success=False,
-                    error='Sync cancelled',
-                    duration_seconds=int((datetime.now() - start_time).total_seconds()),
-                )
+        # Start a watcher thread that kills rclone when stop_event fires
+        if stop_event:
+            watcher = threading.Thread(target=_kill_on_stop, args=(proc, stop_event), daemon=True)
+            watcher.start()
 
-            line = proc.stderr.readline()
-            if not line and proc.poll() is not None:
-                break
-            if line:
-                parse_stats_line(line.strip(), progress)
-                if on_progress:
-                    on_progress(progress)
+        # Read stderr for progress (rclone -v writes stats + info to stderr)
+        for line in proc.stderr:
+            log_fh.write(line)
+            log_fh.flush()
+            parse_stats_line(line.strip(), progress)
+            if on_progress:
+                on_progress(progress)
 
+        proc.wait()
+        log_fh.close()
+
+        cancelled = stop_event and stop_event.is_set()
         duration = int((datetime.now() - start_time).total_seconds())
+
+        if cancelled:
+            return SyncResult(
+                timestamp=datetime.now().strftime('%b %d, %H:%M'),
+                success=False,
+                error='Sync cancelled',
+                duration_seconds=duration,
+            )
 
         if proc.returncode == 0:
             return SyncResult(

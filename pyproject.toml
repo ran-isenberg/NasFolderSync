@@ -1,7 +1,12 @@
 [project]
-name = "unassync"
+name = "foldersync"
 version = "1.0.0"
-description = "NasFolderSync — macOS menu bar app that syncs Google Drive to a NAS via rclone"
+description = "FolderSync — macOS menu bar wrapper around rclone for automated folder sync"
+license = "AGPL-3.0-only"
+authors = [
+    { name = "Ran Isenberg", email = "ran.isenberg@ranthebuilder.cloud" },
+]
+urls = { Homepage = "https://www.ranthebuilder.cloud", Sponsor = "https://github.com/sponsors/ran-isenberg" }
 requires-python = ">=3.14"
 dependencies = [
     "rumps>=0.4.0",
@@ -13,6 +18,7 @@ dev = [
     "pytest>=8.0.0",
     "ruff>=0.11.0",
     "pyinstaller>=6.0.0",
+    "Pillow>=10.0.0",
 ]
 
 [tool.pytest.ini_options]
@@ -69,8 +75,8 @@ indent-style = "space"
 line-ending = "auto"
 
 [tool.ruff.lint.per-file-ignores]
-"tests/**" = ["PLR2004"]
-"app.py" = ["PLR0915"]
+"tests/**" = ["PLR2004", "PLC0415"]
+"app.py" = ["PLR0915", "PLR2004"]
 "sync.py" = ["PLR0913"]
 
 [tool.ruff.lint.isort]

@@ -1,4 +1,4 @@
-.PHONY: install lint fmt test build deploy clean
+.PHONY: install lint fmt test build deploy clean uninstall
 
 install:
 	uv sync
@@ -22,3 +22,8 @@ deploy:
 
 clean:
 	rm -rf dist build __pycache__ .pytest_cache .ruff_cache *.egg-info
+
+uninstall:
+	rm -rf /Applications/FolderSync.app
+	rm -f ~/.foldersync.json ~/.foldersync-history.json ~/foldersync.log
+	@echo "FolderSync uninstalled."

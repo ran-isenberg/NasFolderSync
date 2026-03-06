@@ -1,6 +1,6 @@
-# NasFolderSync — macOS Menu Bar App
+# FolderSync — macOS Menu Bar App
 
-A macOS menu bar application that automatically syncs your Google Drive to a NAS (or any local/network folder) using [rclone](https://rclone.org/). Built with Python, [rumps](https://github.com/jaredks/rumps), and PyInstaller.
+A macOS menu bar wrapper around [rclone](https://rclone.org/) that automatically syncs your Google Drive to a NAS (or any local/network folder) on a schedule. It provides a native UI for what would otherwise be a cron job + CLI command. Built with Python, [rumps](https://github.com/jaredks/rumps), and PyInstaller.
 
 ---
 
@@ -24,7 +24,7 @@ A macOS menu bar application that automatically syncs your Google Drive to a NAS
 ```
 ┌─────────────────────────────────────────────────────┐
 │                    Menu Bar (rumps)                  │
-│  app.py — NasFolderSyncApp                               │
+│  app.py — FolderSyncApp                               │
 │  ┌───────────┐ ┌──────────┐ ┌────────────────────┐  │
 │  │  Status   │ │ Progress │ │ Recent Syncs       │  │
 │  │  ☁️ / 🔄  │ │ Data/ETA │ │ ✅ Mar 05, 10:00   │  │
@@ -52,10 +52,10 @@ A macOS menu bar application that automatically syncs your Google Drive to a NAS
          │                              │
          ▼                              ▼
   ┌──────────────┐             ┌──────────────────┐
-  │   rclone     │             │  ~/.unassync     │
+  │   rclone     │             │  ~/.foldersync     │
   │   sync       │             │  .json           │
   │              │             │  -history.json   │
-  │  Google Drive│             │  ~/unassync      │
+  │  Google Drive│             │  ~/foldersync      │
   │  ──────────► │             │  .log            │
   │  NAS         │             └──────────────────┘
   └──────────────┘
@@ -63,7 +63,7 @@ A macOS menu bar application that automatically syncs your Google Drive to a NAS
 
 ### How it works
 
-1. **Startup** — `app.py` creates a `rumps.App` menu bar icon, loads config from `~/.unassync.json`, and starts a background sync loop thread.
+1. **Startup** — `app.py` creates a `rumps.App` menu bar icon, loads config from `~/.foldersync.json`, and starts a background sync loop thread.
 
 2. **Sync loop** — A daemon thread runs `run_sync_live()` immediately, then sleeps for `interval_minutes` before repeating. The loop respects a `threading.Event` for pause/cancel.
 
@@ -74,9 +74,9 @@ A macOS menu bar application that automatically syncs your Google Drive to a NAS
    - Calls `on_progress` callback to update the menu bar every second
    - Returns a `SyncResult` with outcome, bytes transferred, file count, and duration
 
-4. **History** — Each sync result is appended to `~/.unassync-history.json` (last 20 entries). Viewable in the **Recent Syncs** submenu.
+4. **History** — Each sync result is appended to `~/.foldersync-history.json` (last 20 entries). Viewable in the **Recent Syncs** submenu.
 
-5. **Configuration** — Stored in `~/.unassync.json`. Editable via the **Configure** submenu. Source and destination use a native macOS folder picker (NSOpenPanel).
+5. **Configuration** — Stored in `~/.foldersync.json`. Editable via the **Configure** submenu. Source and destination use a native macOS folder picker (NSOpenPanel).
 
 ### File structure
 
@@ -91,7 +91,7 @@ gdrive-nas-sync/
 ├── pyproject.toml      # Project config (uv, ruff, pytest)
 ├── Makefile            # Dev commands: install, lint, fmt, test, build, deploy
 ├── build.sh            # Build .app + .dmg, optional install
-├── NasFolderSync.spec       # PyInstaller spec for macOS .app bundle
+├── FolderSync.spec       # PyInstaller spec for macOS .app bundle
 ├── .python-version     # Python 3.14
 └── README.md
 ```
@@ -117,7 +117,7 @@ chmod +x build.sh
 ./build.sh
 ```
 
-This installs `rclone`, `uv`, Python dependencies, builds `NasFolderSync.app` and a `.dmg` installer.
+This installs `rclone`, `uv`, Python dependencies, builds `FolderSync.app` and a `.dmg` installer.
 
 ### Install and launch
 
@@ -168,7 +168,7 @@ Click the menu bar icon → **Configure** to set:
 | **Destination** | Path to your NAS mount (opens folder picker) | `/Volumes/NAS` |
 | **Interval** | Minutes between syncs | `5` |
 
-Config is stored at `~/.unassync.json`.
+Config is stored at `~/.foldersync.json`.
 
 ---
 
@@ -183,7 +183,7 @@ Config is stored at `~/.unassync.json`.
 | **Pause / Resume** | Toggle the sync loop |
 | **Recent Syncs** | Last 10 sync results with outcome and stats |
 | **Configure** | Set source, destination, interval |
-| **View Log** | Open `~/unassync.log` in Console.app |
+| **View Log** | Open `~/foldersync.log` in Console.app |
 | **Uninstall...** | Remove app + all data files (Google Drive and NAS untouched) |
 | **Quit** | Stop syncing and exit |
 
@@ -192,7 +192,7 @@ Config is stored at `~/.unassync.json`.
 ## Auto-start on login
 
 1. Open **System Settings → General → Login Items**
-2. Click **+** and add `/Applications/NasFolderSync.app`
+2. Click **+** and add `/Applications/FolderSync.app`
 
 ---
 
@@ -200,11 +200,17 @@ Config is stored at `~/.unassync.json`.
 
 | File | Purpose |
 |------|---------|
-| `~/.unassync.json` | User configuration |
-| `~/.unassync-history.json` | Last 20 sync results |
-| `~/unassync.log` | rclone sync log |
+| `~/.foldersync.json` | User configuration |
+| `~/.foldersync-history.json` | Last 20 sync results |
+| `~/foldersync.log` | rclone sync log |
 
 All removed on uninstall. Your Google Drive and NAS folders are **never** modified or deleted by this app.
+
+To fully uninstall (app + all data files), run:
+
+```bash
+make uninstall
+```
 
 ---
 
@@ -215,5 +221,5 @@ All removed on uninstall. Your Google Drive and NAS folders are **never** modifi
 | ⚠️ "Google Drive not mounted" | Make sure Google Drive for Desktop is running |
 | ⚠️ "NAS not mounted" | Reconnect via Finder → Go → Connect to Server |
 | ⚠️ "rclone not found" | Run `brew install rclone` in Terminal |
-| App doesn't appear | Check `/Applications/NasFolderSync.app` exists, try opening manually |
+| App doesn't appear | Check `/Applications/FolderSync.app` exists, try opening manually |
 | Sync is slow | Check network speed; adjust `--transfers` and `--checkers` in `sync.py` |

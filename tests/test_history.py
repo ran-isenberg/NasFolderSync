@@ -140,12 +140,12 @@ class TestCleanupAppData:
 
 class TestLaunchdPlist:
     def test_install_creates_plist(self, tmp_path):
-        app_path = tmp_path / 'NasFolderSync.app' / 'Contents' / 'MacOS'
+        app_path = tmp_path / 'FolderSync.app' / 'Contents' / 'MacOS'
         app_path.mkdir(parents=True)
-        plist_path = str(tmp_path / 'com.user.unassync.plist')
+        plist_path = str(tmp_path / 'com.ranthebuilder.foldersync.plist')
 
         with (
-            patch('sync.APP_PATH', str(tmp_path / 'NasFolderSync.app')),
+            patch('sync.APP_PATH', str(tmp_path / 'FolderSync.app')),
             patch('sync.LAUNCHD_PLIST', plist_path),
             patch('sync.subprocess.run'),
         ):
@@ -155,11 +155,11 @@ class TestLaunchdPlist:
         assert os.path.exists(plist_path)
         with open(plist_path, 'rb') as f:
             plist = plistlib.load(f)
-        assert plist['Label'] == 'com.user.unassync'
+        assert plist['Label'] == 'com.ranthebuilder.foldersync'
         assert plist['RunAtLoad'] is True
 
     def test_install_fails_when_app_missing(self, tmp_path):
-        plist_path = str(tmp_path / 'com.user.unassync.plist')
+        plist_path = str(tmp_path / 'com.ranthebuilder.foldersync.plist')
 
         with (
             patch('sync.APP_PATH', str(tmp_path / 'NonExistent.app')),
@@ -171,7 +171,7 @@ class TestLaunchdPlist:
         assert not os.path.exists(plist_path)
 
     def test_uninstall_removes_plist(self, tmp_path):
-        plist_path = tmp_path / 'com.user.unassync.plist'
+        plist_path = tmp_path / 'com.ranthebuilder.foldersync.plist'
         plist_path.write_text('fake')
 
         with (
@@ -189,7 +189,7 @@ class TestLaunchdPlist:
         assert result is False
 
     def test_is_launchd_installed(self, tmp_path):
-        plist_path = tmp_path / 'com.user.unassync.plist'
+        plist_path = tmp_path / 'com.ranthebuilder.foldersync.plist'
 
         with patch('sync.LAUNCHD_PLIST', str(plist_path)):
             assert is_launchd_installed() is False

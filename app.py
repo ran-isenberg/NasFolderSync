@@ -2,16 +2,25 @@ import os
 import signal
 import subprocess
 import threading
-import time
+from datetime import datetime, timedelta
 
 import objc
 import rumps
 from AppKit import NSURL, NSOpenPanel
+from PyObjCTools import AppHelper
 
 from sync import (
+    APP_AUTHOR,
+    APP_BUILD_HASH,
+    APP_BUILD_TIME,
+    APP_SPONSOR,
+    APP_VERSION,
+    APP_WEBSITE,
     SyncProgress,
     add_history_entry,
+    find_rclone,
     install_launchd_plist,
+    install_rclone,
     is_launchd_installed,
     load_config,
     load_history,
@@ -39,9 +48,9 @@ def _pick_folder(title: str, start_path: str | None = None) -> str | None:
     return None
 
 
-class NasFolderSyncApp(rumps.App):
+class FolderSyncApp(rumps.App):
     def __init__(self):
-        super().__init__('NasFolderSync', quit_button=None)
+        super().__init__('FolderSync', quit_button=None)
         self.config = load_config()
 
         self.status = 'idle'
@@ -49,6 +58,11 @@ class NasFolderSyncApp(rumps.App):
         self.last_error = None
         self.sync_thread = None
         self.stop_event = threading.Event()
+        self._wake_event = threading.Event()  # wakes the sleep between syncs without stopping
+        self._sync_start_time = None
+        self._initial_bytes_total = None
+        self._next_sync_time = self._load_next_sync_time()
+        self._rclone_proc = None  # track rclone subprocess for force-kill on quit
         self.progress = SyncProgress()
 
         # Menu items
@@ -58,23 +72,28 @@ class NasFolderSyncApp(rumps.App):
         self.last_sync_item = rumps.MenuItem('Last sync: Never')
         self.last_sync_item.set_callback(None)
 
+        self.next_sync_item = rumps.MenuItem('Next sync: —')
+        self.next_sync_item.set_callback(None)
+
         # Progress submenu (visible during sync)
+        # Use stable keys so items update correctly when titles change
         self.progress_menu = rumps.MenuItem('Progress')
         self.progress_data_item = rumps.MenuItem('Data: —')
         self.progress_data_item.set_callback(None)
         self.progress_speed_item = rumps.MenuItem('Speed: —')
         self.progress_speed_item.set_callback(None)
-        self.progress_files_item = rumps.MenuItem('Files: —')
-        self.progress_files_item.set_callback(None)
         self.progress_eta_item = rumps.MenuItem('ETA: —')
         self.progress_eta_item.set_callback(None)
         self.progress_current_item = rumps.MenuItem('File: —')
         self.progress_current_item.set_callback(None)
-        self.progress_menu[self.progress_data_item.title] = self.progress_data_item
-        self.progress_menu[self.progress_speed_item.title] = self.progress_speed_item
-        self.progress_menu[self.progress_files_item.title] = self.progress_files_item
-        self.progress_menu[self.progress_eta_item.title] = self.progress_eta_item
-        self.progress_menu[self.progress_current_item.title] = self.progress_current_item
+        self._progress_items = [
+            ('data', self.progress_data_item),
+            ('speed', self.progress_speed_item),
+            ('eta', self.progress_eta_item),
+            ('current', self.progress_current_item),
+        ]
+        for key, item in self._progress_items:
+            self.progress_menu[key] = item
 
         self.toggle_item = rumps.MenuItem('Pause Sync', callback=self.toggle_sync)
         self.sync_now_item = rumps.MenuItem('Sync Now', callback=self.sync_now)
@@ -99,12 +118,27 @@ class NasFolderSyncApp(rumps.App):
         self.configure_menu[self.autostart_item.title] = self.autostart_item
 
         self.open_log_item = rumps.MenuItem('View Log', callback=self.open_log)
+        self.about_menu = rumps.MenuItem('About')
+        about_version = rumps.MenuItem(f'FolderSync v{APP_VERSION} ({APP_BUILD_HASH})')
+        about_version.set_callback(None)
+        about_build = rumps.MenuItem(f'Built: {APP_BUILD_TIME}')
+        about_build.set_callback(None)
+        about_author = rumps.MenuItem(f'By {APP_AUTHOR}')
+        about_author.set_callback(None)
+        about_website = rumps.MenuItem('Website', callback=lambda _: subprocess.Popen(['open', APP_WEBSITE]))
+        about_sponsor = rumps.MenuItem('Sponsor', callback=lambda _: subprocess.Popen(['open', APP_SPONSOR]))
+        self.about_menu[about_version.title] = about_version
+        self.about_menu[about_build.title] = about_build
+        self.about_menu[about_author.title] = about_author
+        self.about_menu[about_website.title] = about_website
+        self.about_menu[about_sponsor.title] = about_sponsor
         self.uninstall_item = rumps.MenuItem('Uninstall...', callback=self.uninstall)
         self.quit_item = rumps.MenuItem('Quit', callback=self.quit_app)
 
         self.menu = [
             self.status_item,
             self.last_sync_item,
+            self.next_sync_item,
             self.progress_menu,
             None,
             self.sync_now_item,
@@ -113,15 +147,19 @@ class NasFolderSyncApp(rumps.App):
             self.history_menu,
             self.configure_menu,
             self.open_log_item,
+            self.about_menu,
             None,
             self.uninstall_item,
             self.quit_item,
         ]
 
-        self.update_icon()
         self._install_signal_handlers()
         if self.config['enabled']:
+            if self._next_sync_time is None:
+                # Fresh install or cleared — set to now so first sync runs immediately and config has the value
+                self._save_next_sync_time(datetime.now())
             self.start_sync_loop()
+        self.update_menu()
 
     # ── Icon & menu updates ───────────────────────────────────────────
 
@@ -148,22 +186,102 @@ class NasFolderSyncApp(rumps.App):
         else:
             self.last_sync_item.title = 'Last sync: Never'
 
-        if self.config['enabled']:
-            self.toggle_item.title = 'Pause Sync'
+        # Next sync time
+        if self._next_sync_time and self.config['enabled'] and self.status != 'syncing':
+            self.next_sync_item.title = f'Next sync: {self._next_sync_time.strftime("%b %d, %H:%M")}'
+        elif self.status == 'syncing':
+            self.next_sync_item.title = 'Next sync: now'
         else:
+            self.next_sync_item.title = 'Next sync: —'
+
+        # Toggle button state
+        has_active_loop = self.sync_thread is not None and self.sync_thread.is_alive()
+        is_paused = not self.config['enabled']
+
+        if is_paused:
             self.toggle_item.title = 'Resume Sync'
+            self.toggle_item.set_callback(self.toggle_sync)
+        elif has_active_loop:
+            self.toggle_item.title = 'Pause Sync'
+            self.toggle_item.set_callback(self.toggle_sync)
+        else:
+            # No sync loop running and not paused — nothing to pause
+            self.toggle_item.title = 'Pause Sync'
+            self.toggle_item.set_callback(None)
+
+        # Sync Now only available when idle with an active loop (not paused, not syncing)
+        if is_paused or self.status == 'syncing' or not has_active_loop:
+            self.sync_now_item.set_callback(None)
+        else:
+            self.sync_now_item.set_callback(self.sync_now)
 
         self.update_icon()
 
+    @staticmethod
+    def _parse_bytes(s: str) -> float:
+        """Parse a human-readable byte string like '1.234 GiB' to bytes."""
+        units = {'B': 1, 'KiB': 1024, 'MiB': 1024**2, 'GiB': 1024**3, 'TiB': 1024**4}
+        parts = s.strip().split()
+        if len(parts) == 2 and parts[1] in units:
+            try:
+                return float(parts[0]) * units[parts[1]]
+            except ValueError:
+                pass
+        return 0.0
+
+    @staticmethod
+    def _format_duration(seconds: int) -> str:
+        """Format seconds to human-readable duration like '5m30s' or '1h15m'."""
+        if seconds < 60:
+            return f'{seconds}s'
+        minutes, secs = divmod(seconds, 60)
+        if minutes < 60:
+            return f'{minutes}m{secs}s'
+        hours, minutes = divmod(minutes, 60)
+        return f'{hours}h{minutes}m'
+
+    @staticmethod
+    def _format_speed(bytes_per_sec: float) -> str:
+        """Format bytes/sec to human-readable speed."""
+        if bytes_per_sec >= 1024**3:
+            return f'{bytes_per_sec / 1024**3:.1f} GiB/s'
+        if bytes_per_sec >= 1024**2:
+            return f'{bytes_per_sec / 1024**2:.1f} MiB/s'
+        if bytes_per_sec >= 1024:
+            return f'{bytes_per_sec / 1024:.1f} KiB/s'
+        return f'{bytes_per_sec:.0f} B/s'
+
     def _update_progress_menu(self, progress: SyncProgress):
         self.progress = progress
-        if progress.bytes_total:
-            self.progress_data_item.title = f'Data: {progress.bytes_transferred} / {progress.bytes_total} ({progress.percent}%)'
-        self.progress_speed_item.title = f'Speed: {progress.speed or "—"}'
-        if progress.files_total:
-            files_left = progress.files_total - progress.files_done
-            self.progress_files_item.title = f'Files: {progress.files_done} / {progress.files_total} ({files_left} left)'
-        self.progress_eta_item.title = f'ETA: {progress.eta or "—"}'
+        # Capture the initial total size on the first progress update
+        if progress.bytes_total and self._initial_bytes_total is None:
+            self._initial_bytes_total = progress.bytes_total
+        if progress.bytes_transferred and self._initial_bytes_total:
+            self.progress_data_item.title = f'Data: {progress.bytes_transferred} / {self._initial_bytes_total} ({progress.percent}%)'
+        # Calculate speed and ETA from total transferred / elapsed time
+        elapsed = (datetime.now() - self._sync_start_time).total_seconds() if self._sync_start_time else 0
+        bytes_per_sec = 0.0
+        if elapsed > 0 and progress.bytes_transferred:
+            transferred_bytes = self._parse_bytes(progress.bytes_transferred)
+            if transferred_bytes > 0:
+                bytes_per_sec = transferred_bytes / elapsed
+                self.progress_speed_item.title = f'Speed: {self._format_speed(bytes_per_sec)}'
+            else:
+                self.progress_speed_item.title = 'Speed: —'
+        else:
+            self.progress_speed_item.title = 'Speed: —'
+        # ETA from remaining bytes / speed
+        if bytes_per_sec > 0 and self._initial_bytes_total:
+            total_bytes = self._parse_bytes(self._initial_bytes_total)
+            transferred_bytes = self._parse_bytes(progress.bytes_transferred)
+            remaining_bytes = total_bytes - transferred_bytes
+            if remaining_bytes > 0:
+                eta_seconds = int(remaining_bytes / bytes_per_sec)
+                self.progress_eta_item.title = f'ETA: {self._format_duration(eta_seconds)}'
+            else:
+                self.progress_eta_item.title = 'ETA: done'
+        else:
+            self.progress_eta_item.title = 'ETA: —'
         if progress.current_file:
             name = progress.current_file
             max_display = 40
@@ -202,47 +320,151 @@ class NasFolderSyncApp(rumps.App):
     def _reset_progress_menu(self):
         self.progress_data_item.title = 'Data: —'
         self.progress_speed_item.title = 'Speed: —'
-        self.progress_files_item.title = 'Files: —'
         self.progress_eta_item.title = 'ETA: —'
         self.progress_current_item.title = 'File: —'
+        self._initial_bytes_total = None
 
     # ── Sync loop ─────────────────────────────────────────────────────
 
+    def _ensure_rclone(self) -> bool:
+        """Check if rclone is available; if not, offer to install it. Returns True if ready."""
+        if find_rclone():
+            return True
+
+        response = rumps.alert(
+            title='rclone not found',
+            message='FolderSync requires rclone to sync files.\n\nInstall it now via Homebrew?',
+            ok='Install',
+            cancel='Cancel',
+        )
+        if response != 1:
+            rumps.notification('FolderSync', 'rclone required', 'Install rclone manually: brew install rclone', sound=False)
+            return False
+
+        rumps.notification('FolderSync', 'Installing rclone...', 'This may take a minute.', sound=False)
+        path = install_rclone()
+        if path:
+            rumps.notification('FolderSync', 'rclone installed', 'Ready to sync.', sound=False)
+            return True
+        else:
+            rumps.notification('FolderSync', 'Installation failed', 'Install manually: brew install rclone', sound=False)
+            return False
+
+    def _load_next_sync_time(self) -> datetime | None:
+        """Load next_sync_time from config. Returns None if not set or invalid."""
+        raw = self.config.get('next_sync_time')
+        if raw:
+            try:
+                return datetime.fromisoformat(raw)
+            except (ValueError, TypeError):
+                pass
+        return None
+
+    def _save_next_sync_time(self, dt: datetime | None):
+        """Persist next_sync_time to config file."""
+        self._next_sync_time = dt
+        self.config['next_sync_time'] = dt.isoformat() if dt else None
+        save_config(self.config)
+
     def start_sync_loop(self):
+        if not self._ensure_rclone():
+            self.status = 'error'
+            self.last_error = 'rclone not installed'
+            self.update_menu()
+            return
         self.stop_event.clear()
+        self._wake_event.clear()
         self.sync_thread = threading.Thread(target=self._sync_loop, daemon=True)
         self.sync_thread.start()
 
+    def _wait_until_next_sync(self, remaining: float) -> bool:
+        """Wait for `remaining` seconds, handling wake events (config changes).
+        Returns True if we should sync, False if stopped."""
+        self._wake_event.clear()
+        while remaining > 0 and not self.stop_event.is_set():
+            if self._wake_event.wait(timeout=remaining):
+                # Config changed — recalculate with new interval
+                self._wake_event.clear()
+                interval = self.config['interval_minutes'] * 60
+                elapsed = (datetime.now() - self._sync_start_time).total_seconds() if self._sync_start_time else 0
+                remaining = max(0, interval - elapsed)
+                self._save_next_sync_time(datetime.now() + timedelta(seconds=remaining))
+                self._on_main_thread(self.update_menu)
+            else:
+                break  # timeout expired — time to sync
+        return not self.stop_event.is_set()
+
     def _sync_loop(self):
+        # Check if we have a saved next_sync_time that hasn't passed yet
+        if self._next_sync_time and self._next_sync_time > datetime.now():
+            remaining = (self._next_sync_time - datetime.now()).total_seconds()
+            self._on_main_thread(self.update_menu)
+            if not self._wait_until_next_sync(remaining):
+                return  # stopped — keep saved next_sync_time for restart
+        # Either no saved time, or it has passed — sync now
         self._run_sync()
-        while not self.stop_event.wait(timeout=self.config['interval_minutes'] * 60):
+        while not self.stop_event.is_set():
+            interval = self.config['interval_minutes'] * 60
+            sync_duration = (datetime.now() - self._sync_start_time).total_seconds() if self._sync_start_time else 0
+            remaining = max(0, interval - sync_duration)
+            self._save_next_sync_time(datetime.now() + timedelta(seconds=remaining))
+            self._on_main_thread(self.update_menu)
+            if not self._wait_until_next_sync(remaining):
+                break  # stopped — keep saved next_sync_time for restart
             if self.config['enabled']:
+                self._save_next_sync_time(None)
                 self._run_sync()
 
+    def _on_main_thread(self, fn):
+        """Schedule fn to run on the main thread (required for UI updates)."""
+        AppHelper.callAfter(fn)
+
     def _run_sync(self):
-        self.status = 'syncing'
-        self._reset_progress_menu()
-        self.update_menu()
+        max_retries = 3
+        retry_delay = 30
+        non_retryable = {'Google Drive not mounted', 'NAS not mounted', 'rclone not found — run: brew install rclone', 'Sync cancelled'}
 
-        result = run_sync_live(
-            self.config['source'],
-            self.config['destination'],
-            on_progress=self._update_progress_menu,
-            stop_event=self.stop_event,
-            use_checksum=self.config.get('use_checksum', False),
-        )
+        for attempt in range(1, max_retries + 1):
+            self._sync_start_time = datetime.now()
+            self.status = 'syncing'
+            self._on_main_thread(lambda: (self._reset_progress_menu(), self.update_menu()))
 
-        if result.success:
-            self.status = 'idle'
-            self.last_error = None
-            self.last_sync = result.timestamp
-        else:
-            self.status = 'error'
-            self.last_error = result.error
+            def _progress_callback(progress):
+                self._on_main_thread(lambda: self._update_progress_menu(progress))
 
-        add_history_entry(result)
-        self._rebuild_history_menu()
-        self.update_menu()
+            result = run_sync_live(
+                self.config['source'],
+                self.config['destination'],
+                on_progress=_progress_callback,
+                stop_event=self.stop_event,
+                use_checksum=self.config.get('use_checksum', False),
+                on_start=lambda proc: setattr(self, '_rclone_proc', proc),
+            )
+            self._rclone_proc = None
+
+            if result.success:
+                self.status = 'idle'
+                self.last_error = None
+                self.last_sync = result.timestamp
+                break
+            elif self.status == 'paused' or self.stop_event.is_set():
+                # Cancelled by pause/quit — don't overwrite paused status with error
+                break
+            elif result.error in non_retryable or attempt == max_retries:
+                self.status = 'error'
+                self.last_error = result.error
+                break
+            else:
+                # Transient error — retry after delay
+                self.status = 'error'
+                self.last_error = f'{result.error} (retry {attempt}/{max_retries})'
+                self._on_main_thread(self.update_menu)
+                if self.stop_event.wait(timeout=retry_delay):
+                    break  # stopped during retry wait
+
+        if result.success or result.error != 'Sync cancelled':
+            add_history_entry(result)
+        self._on_main_thread(lambda: (self._rebuild_history_menu(), self.update_menu()))
 
     # ── Signal handling ────────────────────────────────────────────────
 
@@ -251,7 +473,7 @@ class NasFolderSyncApp(rumps.App):
             signal.signal(sig, self._handle_signal)
 
     def _handle_signal(self, signum, _frame):
-        self.stop_event.set()
+        self._shutdown()
         rumps.quit_application()
 
     # ── Actions ───────────────────────────────────────────────────────
@@ -264,8 +486,9 @@ class NasFolderSyncApp(rumps.App):
             self.status = 'idle'
             self.start_sync_loop()
         else:
-            self.stop_event.set()
             self.status = 'paused'
+            self._save_next_sync_time(None)  # clear scheduled sync when pausing
+            self.stop_event.set()
 
         self.update_menu()
 
@@ -277,11 +500,8 @@ class NasFolderSyncApp(rumps.App):
     def _save_and_restart(self):
         save_config(self.config)
         self._update_config_menu()
-        rumps.notification('NasFolderSync', 'Config saved', 'Settings updated. Restarting sync loop.', sound=False)
-        self.stop_event.set()
-        if self.config['enabled']:
-            time.sleep(0.5)
-            self.start_sync_loop()
+        self._wake_event.set()  # wake sync loop to recalculate next sync time
+        rumps.notification('FolderSync', 'Config saved', 'Settings updated.', sound=False)
 
     def _update_config_menu(self):
         self.source_item.title = f'Source: {self.config["source"]}'
@@ -314,55 +534,70 @@ class NasFolderSyncApp(rumps.App):
             try:
                 minutes = int(response.text.strip())
                 if minutes < 1:
-                    rumps.notification('NasFolderSync', 'Error', 'Interval must be at least 1 minute.', sound=False)
+                    rumps.notification('FolderSync', 'Error', 'Interval must be at least 1 minute.', sound=False)
                     return
                 self.config['interval_minutes'] = minutes
                 self._save_and_restart()
             except ValueError:
-                rumps.notification('NasFolderSync', 'Error', 'Please enter a valid number.', sound=False)
+                rumps.notification('FolderSync', 'Error', 'Please enter a valid number.', sound=False)
 
     def toggle_checksum(self, _):
         self.config['use_checksum'] = not self.config.get('use_checksum', False)
         self.checksum_item.state = self.config['use_checksum']
         save_config(self.config)
         label = 'enabled' if self.config['use_checksum'] else 'disabled'
-        rumps.notification('NasFolderSync', 'Checksum mode', f'Checksum comparison {label}.', sound=False)
+        rumps.notification('FolderSync', 'Checksum mode', f'Checksum comparison {label}.', sound=False)
 
     def toggle_autostart(self, _):
         if is_launchd_installed():
             uninstall_launchd_plist()
             self.autostart_item.state = False
-            rumps.notification('NasFolderSync', 'Auto-start disabled', 'App will no longer start on login.', sound=False)
+            rumps.notification('FolderSync', 'Auto-start disabled', 'App will no longer start on login.', sound=False)
         elif install_launchd_plist():
             self.autostart_item.state = True
-            rumps.notification('NasFolderSync', 'Auto-start enabled', 'App will start automatically on login.', sound=False)
+            rumps.notification('FolderSync', 'Auto-start enabled', 'App will start automatically on login.', sound=False)
         else:
-            rumps.notification('NasFolderSync', 'Error', 'App not found in /Applications. Install first.', sound=False)
+            rumps.notification('FolderSync', 'Error', 'App not found in /Applications. Install first.', sound=False)
 
     def open_log(self, _):
-        log = os.path.expanduser('~/unassync.log')
+        log = os.path.expanduser('~/foldersync.log')
         if os.path.exists(log):
             subprocess.Popen(['open', '-a', 'Console', log])
         else:
-            rumps.notification('NasFolderSync', 'No log yet', 'Run a sync first.', sound=False)
+            rumps.notification('FolderSync', 'No log yet', 'Run a sync first.', sound=False)
 
     def uninstall(self, _):
         response = rumps.alert(
-            title='Uninstall NasFolderSync',
+            title='Uninstall FolderSync',
             message='This will remove the app, config, history, and log files.\nYour Google Drive and NAS folders will NOT be touched.',
             ok='Uninstall',
             cancel='Cancel',
         )
         if response == 1:
-            self.stop_event.set()
+            self._shutdown()
             removed = uninstall_app()
-            rumps.notification('NasFolderSync', 'Uninstalled', f'Removed {len(removed)} items. Goodbye!', sound=False)
+            rumps.notification('FolderSync', 'Uninstalled', f'Removed {len(removed)} items. Goodbye!', sound=False)
             rumps.quit_application()
 
-    def quit_app(self, _):
+    def _shutdown(self):
+        """Stop sync and kill any running rclone subprocess."""
         self.stop_event.set()
+        self._wake_event.set()
+        proc = self._rclone_proc
+        if proc:
+            try:
+                proc.terminate()
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+            except OSError:
+                pass
+
+    def quit_app(self, _):
+        self._shutdown()
         rumps.quit_application()
 
 
 if __name__ == '__main__':
-    NasFolderSyncApp().run()
+    FolderSyncApp().run()

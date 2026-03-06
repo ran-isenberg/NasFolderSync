@@ -1,4 +1,5 @@
 import json
+import os
 
 from sync import DEFAULT_CONFIG, load_config, save_config
 
@@ -6,6 +7,17 @@ from sync import DEFAULT_CONFIG, load_config, save_config
 def test_load_config_returns_defaults_when_no_file(tmp_path):
     config_file = str(tmp_path / 'nonexistent.json')
     config = load_config(config_file)
+    assert config == DEFAULT_CONFIG
+
+
+def test_load_config_creates_file_on_first_launch(tmp_path):
+    config_file = str(tmp_path / 'fresh.json')
+    assert not os.path.exists(config_file)
+    config = load_config(config_file)
+    assert os.path.exists(config_file)
+    with open(config_file) as f:
+        saved = json.load(f)
+    assert saved == DEFAULT_CONFIG
     assert config == DEFAULT_CONFIG
 
 
