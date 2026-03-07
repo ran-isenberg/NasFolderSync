@@ -338,6 +338,17 @@ class FolderSyncApp(rumps.App):
 
     def _poll_ui(self, _):
         """Called every second on the main thread by rumps.Timer. Safe to update UI here."""
+        # Detect wake from sleep: if next_sync_time is in the past but sync loop
+        # is still waiting (Event.wait uses monotonic clock which pauses during sleep),
+        # wake it up so it syncs immediately.
+        if (
+            self._next_sync_time
+            and self._next_sync_time < datetime.now()
+            and self.status != 'syncing'
+            and self.config['enabled']
+        ):
+            self._wake_event.set()
+
         if self._rebuild_history:
             self._rebuild_history = False
             self._rebuild_history_menu()
