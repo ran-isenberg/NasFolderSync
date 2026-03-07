@@ -53,13 +53,14 @@ class FolderSyncApp(rumps.App):
         self.config = load_config()
 
         self.status = 'idle'
-        self.last_sync = None
+        history = load_history()
+        self.last_sync = history[-1]['timestamp'] if history else None
         self.last_error = None
         self.sync_thread = None
         self.stop_event = threading.Event()
         self._wake_event = threading.Event()  # wakes the sleep between syncs without stopping
         self._sync_start_time = None
-        self._sync_end_time = None
+        self._sync_end_time = self._load_sync_end_time()
         self._initial_bytes_total = None
         self._next_sync_time = self._load_next_sync_time()
         self._rclone_proc = None  # track rclone subprocess for force-kill on quit
@@ -79,25 +80,10 @@ class FolderSyncApp(rumps.App):
         self.next_sync_item = rumps.MenuItem('Next sync: —')
         self.next_sync_item.set_callback(None)
 
-        # Progress submenu (visible during sync)
-        # Use stable keys so items update correctly when titles change
-        self.progress_menu = rumps.MenuItem('Progress')
-        self.progress_data_item = rumps.MenuItem('Data: —')
-        self.progress_data_item.set_callback(None)
-        self.progress_speed_item = rumps.MenuItem('Speed: —')
-        self.progress_speed_item.set_callback(None)
-        self.progress_eta_item = rumps.MenuItem('ETA: —')
-        self.progress_eta_item.set_callback(None)
-        self.progress_current_item = rumps.MenuItem('File: —')
-        self.progress_current_item.set_callback(None)
-        self._progress_items = [
-            ('data', self.progress_data_item),
-            ('speed', self.progress_speed_item),
-            ('eta', self.progress_eta_item),
-            ('current', self.progress_current_item),
-        ]
-        for key, item in self._progress_items:
-            self.progress_menu[key] = item
+        # Single progress line (grayed out, shown only during sync)
+        self.progress_item = rumps.MenuItem('')
+        self.progress_item.set_callback(None)
+        self.progress_item.hidden = True
 
         self.toggle_item = rumps.MenuItem('Pause Sync', callback=self.toggle_sync)
         self.sync_now_item = rumps.MenuItem('Sync Now', callback=self.sync_now)
@@ -126,11 +112,17 @@ class FolderSyncApp(rumps.App):
         about_build.set_callback(None)
         about_author = rumps.MenuItem(f'By {APP_AUTHOR}')
         about_author.set_callback(None)
+        about_license = rumps.MenuItem('License: AGPL-3.0')
+        about_license.set_callback(None)
+        about_copyright = rumps.MenuItem(f'Copyright (C) 2026 {APP_AUTHOR}')
+        about_copyright.set_callback(None)
         about_website = rumps.MenuItem('Website', callback=lambda _: subprocess.Popen(['open', APP_WEBSITE]))
         about_sponsor = rumps.MenuItem('Sponsor', callback=lambda _: subprocess.Popen(['open', APP_SPONSOR]))
         self.about_menu[about_version.title] = about_version
         self.about_menu[about_build.title] = about_build
         self.about_menu[about_author.title] = about_author
+        self.about_menu[about_license.title] = about_license
+        self.about_menu[about_copyright.title] = about_copyright
         self.about_menu[about_website.title] = about_website
         self.about_menu[about_sponsor.title] = about_sponsor
         self.uninstall_item = rumps.MenuItem('Uninstall...', callback=self.uninstall)
@@ -140,7 +132,7 @@ class FolderSyncApp(rumps.App):
             self.status_item,
             self.last_sync_item,
             self.next_sync_item,
-            self.progress_menu,
+            self.progress_item,
             None,
             self.sync_now_item,
             self.toggle_item,
@@ -193,10 +185,12 @@ class FolderSyncApp(rumps.App):
             self.last_sync_item.title = 'Last sync: Never'
 
         # Next sync time
-        if self._next_sync_time and self.config['enabled'] and self.status != 'syncing':
-            self.next_sync_item.title = f'Next sync: {self._next_sync_time.strftime("%b %d, %H:%M")}'
+        if not self.config['enabled']:
+            self.next_sync_item.title = 'Next sync: paused'
         elif self.status == 'syncing':
             self.next_sync_item.title = 'Next sync: now'
+        elif self._next_sync_time:
+            self.next_sync_item.title = f'Next sync: {self._next_sync_time.strftime("%b %d, %H:%M")}'
         else:
             self.next_sync_item.title = 'Next sync: —'
 
@@ -257,54 +251,27 @@ class FolderSyncApp(rumps.App):
             return f'{bytes_per_sec / 1024:.1f} KiB/s'
         return f'{bytes_per_sec:.0f} B/s'
 
-    def _update_progress_menu(self):
-        """Update progress menu items from self.progress. Must be called on main thread."""
+    def _update_progress_line(self):
+        """Build a single progress line from current state. Called every second from _poll_ui."""
+        if self.status != 'syncing':
+            self.progress_item.hidden = True
+            return
+        self.progress_item.hidden = False
+        elapsed = int((datetime.now() - self._sync_start_time).total_seconds()) if self._sync_start_time else 0
+        elapsed_str = self._format_duration(elapsed)
         progress = self.progress
-        # Track the max total seen (total grows as rclone discovers more files during scan)
+        # Track max bytes total (grows as rclone discovers files)
         if progress.bytes_total:
             if self._initial_bytes_total is None:
                 self._initial_bytes_total = progress.bytes_total
             elif self._parse_bytes(progress.bytes_total) > self._parse_bytes(self._initial_bytes_total):
                 self._initial_bytes_total = progress.bytes_total
-        if progress.checks_total > 0 and progress.percent >= 100:
-            # Checksum-only run: transfers done, still checking files
-            check_pct = int(progress.checks_done / progress.checks_total * 100) if progress.checks_total else 0
-            self.progress_data_item.title = f'Checking: {progress.checks_done} / {progress.checks_total} files ({check_pct}%)'
+        if progress.checks_total > 0:
+            self.progress_item.title = f'Checking {progress.checks_done}/{progress.checks_total} files — {elapsed_str}'
         elif progress.bytes_transferred and self._initial_bytes_total:
-            self.progress_data_item.title = f'Data: {progress.bytes_transferred} / {self._initial_bytes_total} ({progress.percent}%)'
-        # Calculate speed and ETA from total transferred / elapsed time
-        elapsed = (datetime.now() - self._sync_start_time).total_seconds() if self._sync_start_time else 0
-        bytes_per_sec = 0.0
-        if elapsed > 0 and progress.bytes_transferred:
-            transferred_bytes = self._parse_bytes(progress.bytes_transferred)
-            if transferred_bytes > 0:
-                bytes_per_sec = transferred_bytes / elapsed
-                self.progress_speed_item.title = f'Speed: {self._format_speed(bytes_per_sec)}'
-            else:
-                self.progress_speed_item.title = 'Speed: —'
+            self.progress_item.title = f'{progress.bytes_transferred} / {self._initial_bytes_total} ({progress.percent}%) — {elapsed_str}'
         else:
-            self.progress_speed_item.title = 'Speed: —'
-        # ETA from remaining bytes / speed
-        if bytes_per_sec > 0 and self._initial_bytes_total:
-            total_bytes = self._parse_bytes(self._initial_bytes_total)
-            transferred_bytes = self._parse_bytes(progress.bytes_transferred)
-            remaining_bytes = total_bytes - transferred_bytes
-            if remaining_bytes > 0:
-                eta_seconds = int(remaining_bytes / bytes_per_sec)
-                self.progress_eta_item.title = f'ETA: {self._format_duration(eta_seconds)}'
-            elif progress.percent >= 100:
-                self.progress_eta_item.title = 'ETA: done'
-            else:
-                # transferred >= tracked total but rclone still scanning/working
-                self.progress_eta_item.title = 'ETA: calculating...'
-        else:
-            self.progress_eta_item.title = 'ETA: —'
-        if progress.current_file:
-            name = progress.current_file
-            max_display = 40
-            if len(name) > max_display:
-                name = '...' + name[-(max_display - 3) :]
-            self.progress_current_item.title = f'File: {name}'
+            self.progress_item.title = f'Scanning... — {elapsed_str}'
 
     def _rebuild_history_menu(self):
         # Clear existing items
@@ -335,10 +302,7 @@ class FolderSyncApp(rumps.App):
             self.history_menu[label] = item
 
     def _reset_progress_menu(self):
-        self.progress_data_item.title = 'Data: —'
-        self.progress_speed_item.title = 'Speed: —'
-        self.progress_eta_item.title = 'ETA: —'
-        self.progress_current_item.title = 'File: —'
+        self.progress_item.title = 'Scanning...'
         self._initial_bytes_total = None
 
     def _poll_ui(self, _):
@@ -346,13 +310,11 @@ class FolderSyncApp(rumps.App):
         # Detect wake from sleep: if next_sync_time is in the past but sync loop
         # is still waiting (Event.wait uses monotonic clock which pauses during sleep),
         # wake it up so it syncs immediately.
-        if (
-            self._next_sync_time
-            and self._next_sync_time < datetime.now()
-            and self.status != 'syncing'
-            and self.config['enabled']
-        ):
+        if self._next_sync_time and self._next_sync_time < datetime.now() and self.status != 'syncing' and self.config['enabled']:
             self._wake_event.set()
+
+        # Update progress line every second (independent of rclone output)
+        self._update_progress_line()
 
         if self._rebuild_history:
             self._rebuild_history = False
@@ -360,8 +322,6 @@ class FolderSyncApp(rumps.App):
 
         if self._ui_dirty:
             self._ui_dirty = False
-            if self.status == 'syncing':
-                self._update_progress_menu()
             self.update_menu()
 
     def _mark_ui_dirty(self):
@@ -400,7 +360,7 @@ class FolderSyncApp(rumps.App):
         if raw:
             try:
                 return datetime.fromisoformat(raw)
-            except (ValueError, TypeError):
+            except ValueError, TypeError:
                 pass
         return None
 
@@ -409,6 +369,15 @@ class FolderSyncApp(rumps.App):
         self._next_sync_time = dt
         self.config['next_sync_time'] = dt.isoformat() if dt else None
         save_config(self.config)
+
+    def _load_sync_end_time(self) -> datetime | None:
+        raw = self.config.get('last_sync_end_time')
+        if raw:
+            try:
+                return datetime.fromisoformat(raw)
+            except (ValueError, TypeError):
+                pass
+        return None
 
     def start_sync_loop(self):
         if not self._ensure_rclone():
@@ -505,6 +474,8 @@ class FolderSyncApp(rumps.App):
                     break  # stopped during retry wait
 
         self._sync_end_time = datetime.now()
+        self.config['last_sync_end_time'] = self._sync_end_time.isoformat()
+        save_config(self.config)
         if result.success or result.error != 'Sync cancelled':
             add_history_entry(result)
         self._rebuild_history = True
@@ -530,10 +501,18 @@ class FolderSyncApp(rumps.App):
 
         if self.config['enabled']:
             self.status = 'idle'
+            # Calculate next sync from last sync end instead of syncing immediately
+            interval = self.config['interval_minutes'] * 60
+            if self._sync_end_time:
+                since_last = (datetime.now() - self._sync_end_time).total_seconds()
+                remaining = max(0, interval - since_last)
+            else:
+                remaining = 0  # no previous sync — sync now
+            self._save_next_sync_time(datetime.now() + timedelta(seconds=remaining))
             self.start_sync_loop()
         else:
             self.status = 'paused'
-            self._save_next_sync_time(None)  # clear scheduled sync when pausing
+            self._save_next_sync_time(None)
             self.stop_event.set()
 
         self.update_menu()
@@ -607,12 +586,7 @@ class FolderSyncApp(rumps.App):
     def open_log(self, _):
         log = os.path.expanduser('~/foldersync.log')
         if os.path.exists(log):
-            script = (
-                f'tell application "Terminal"\n'
-                f'  activate\n'
-                f'  do script "tail -n 80 -f {log}"\n'
-                f'end tell'
-            )
+            script = f'tell application "Terminal"\n  activate\n  do script "tail -n 80 -f {log}"\nend tell'
             subprocess.Popen(['osascript', '-e', script])
         else:
             rumps.notification('FolderSync', 'No log yet', 'Run a sync first.', sound=False)

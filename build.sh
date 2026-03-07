@@ -137,7 +137,7 @@ if [ "${1:-}" = "--install" ]; then
   echo "✅  Installed to /Applications"
 
   # Strip quarantine so Gatekeeper doesn't block first launch
-  xattr -rd com.apple.quarantine "/Applications/FolderSync.app" 2>/dev/null || true
+  find "/Applications/FolderSync.app" -exec xattr -d com.apple.quarantine {} \; 2>/dev/null || true
 
   echo ""
   echo "🚀  Launching FolderSync..."

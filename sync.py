@@ -41,7 +41,7 @@ DEFAULT_CONFIG = {
 _RE_TRANSFER_STATS = re.compile(
     r'(?:Transferred:\s+)?'
     r'(?P<transferred>[\d.]+ \S+)\s*/\s*(?P<total>[\d.]+ \S+),\s*'
-    r'(?P<percent>\d+)%'
+    r'(?P<percent>\d+|-)%?'
     r'(?:,\s*(?P<speed>[\d.]+ \S+/s))?'
     r'(?:,\s*ETA\s*(?P<eta>\S+))?'
 )
@@ -55,8 +55,11 @@ _RE_CURRENT_FILE = re.compile(r'^\s*\*\s+(?P<name>.+?):\s*(?P<detail>.+)$')
 # rclone -v INFO line: "2026/03/06 17:45:33 INFO  : file.txt: Copied (server-side copy)"
 _RE_INFO_FILE = re.compile(r'INFO\s*:\s*(?P<name>.+?):\s*(?P<detail>Copied|Moved|Deleted|Updated|Unchanged|Skipped)')
 
-# Checksum checking progress: "(chk#1179/7657)"
+# Checksum checking progress: "(chk#1179/7657)" on transfer line
 _RE_CHECK_STATS = re.compile(r'\(chk#(?P<done>\d+)/(?P<total>\d+)\)')
+
+# "Checks:  1179 / 7657, 15%" — separate checks line from rclone
+_RE_CHECKS_LINE = re.compile(r'Checks:\s+(?P<done>\d+)\s*/\s*(?P<total>\d+),\s*(?P<percent>\d+)%')
 
 # Log prefix pattern: "2026/03/06 17:45:33 NOTICE: " or "2026/03/06 17:45:33 INFO  : "
 _RE_LOG_PREFIX = re.compile(r'^\d{4}/\d{2}/\d{2}\s+\d{2}:\d{2}:\d{2}\s+\w+\s*:\s*')
@@ -97,7 +100,8 @@ def parse_stats_line(line: str, progress: SyncProgress) -> SyncProgress:
     if m:
         progress.bytes_transferred = m.group('transferred')
         progress.bytes_total = m.group('total')
-        progress.percent = int(m.group('percent'))
+        pct = m.group('percent')
+        progress.percent = int(pct) if pct != '-' else 0
         if m.group('speed'):
             progress.speed = m.group('speed')
         if m.group('eta'):
@@ -107,6 +111,20 @@ def parse_stats_line(line: str, progress: SyncProgress) -> SyncProgress:
         if chk:
             progress.checks_done = int(chk.group('done'))
             progress.checks_total = int(chk.group('total'))
+        return progress
+
+    # Try (chk#N/M) anywhere on the line (fallback if transfer stats regex didn't match)
+    chk = _RE_CHECK_STATS.search(stripped)
+    if chk:
+        progress.checks_done = int(chk.group('done'))
+        progress.checks_total = int(chk.group('total'))
+        return progress
+
+    # Try checks line: "Checks:  1179 / 7657, 15%"
+    m = _RE_CHECKS_LINE.search(stripped)
+    if m:
+        progress.checks_done = int(m.group('done'))
+        progress.checks_total = int(m.group('total'))
         return progress
 
     # Try file count stats
@@ -325,7 +343,7 @@ def build_rclone_command(source: str, destination: str, log_file: str | None = N
         destination,
         '--transfers=4',
         '--checkers=8',
-        '--stats=1s',
+        '--stats=0.5s',
         '--stats-one-line',
     ]
     if live:

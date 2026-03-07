@@ -62,7 +62,7 @@ class TestBuildRcloneCommand:
 
     def test_includes_stats_flags(self):
         cmd = build_rclone_command('/src', '/dst')
-        assert '--stats=1s' in cmd
+        assert '--stats=0.5s' in cmd
         assert '--stats-one-line' in cmd
         assert '--stats-log-level=NOTICE' in cmd
         assert '-v' not in cmd

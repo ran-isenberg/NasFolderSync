@@ -146,6 +146,7 @@ class TestUpdateMenuStates:
                 app.next_sync_item = MagicMock()
                 app.toggle_item = MagicMock()
                 app.sync_now_item = MagicMock()
+                app.progress_item = MagicMock()
                 return app
 
     def test_pause_disabled_when_no_sync_loop(self):
@@ -156,15 +157,27 @@ class TestUpdateMenuStates:
         # No active loop and not paused → Pause Sync disabled (callback=None)
         app.toggle_item.set_callback.assert_called_with(None)
 
-    def test_pause_enabled_when_sync_loop_active(self):
+    def test_pause_enabled_when_syncing(self):
         app = self._make_app()
         mock_thread = MagicMock()
         mock_thread.is_alive.return_value = True
         app.sync_thread = mock_thread
         app.config['enabled'] = True
+        app.status = 'syncing'
         app.update_menu()
         assert app.toggle_item.title == 'Pause Sync'
         app.toggle_item.set_callback.assert_called_with(app.toggle_sync)
+
+    def test_pause_grayed_out_when_idle(self):
+        app = self._make_app()
+        mock_thread = MagicMock()
+        mock_thread.is_alive.return_value = True
+        app.sync_thread = mock_thread
+        app.config['enabled'] = True
+        app.status = 'idle'
+        app.update_menu()
+        assert app.toggle_item.title == 'Pause Sync'
+        app.toggle_item.set_callback.assert_called_with(None)
 
     def test_resume_shown_when_paused(self):
         app = self._make_app()
@@ -220,6 +233,7 @@ class TestNextSyncTime:
             app.next_sync_item = MagicMock()
             app.toggle_item = MagicMock()
             app.sync_now_item = MagicMock()
+            app.progress_item = MagicMock()
             return app
 
     def test_next_sync_shows_time_when_set(self):
@@ -239,12 +253,12 @@ class TestNextSyncTime:
         app.update_menu()
         assert app.next_sync_item.title == 'Next sync: now'
 
-    def test_next_sync_shows_dash_when_disabled(self):
+    def test_next_sync_shows_paused_when_disabled(self):
         app = self._make_app()
         app.config['enabled'] = False
         app._next_sync_time = datetime(2026, 3, 6, 14, 30)
         app.update_menu()
-        assert app.next_sync_item.title == 'Next sync: —'
+        assert app.next_sync_item.title == 'Next sync: paused'
 
     def test_next_sync_shows_dash_when_no_time(self):
         app = self._make_app()
@@ -273,6 +287,7 @@ class TestStatusDisplay:
             app.next_sync_item = MagicMock()
             app.toggle_item = MagicMock()
             app.sync_now_item = MagicMock()
+            app.progress_item = MagicMock()
             return app
 
     def test_idle_status(self):
@@ -343,6 +358,7 @@ class TestNextSyncTimePersistence:
             app.next_sync_item = MagicMock()
             app.toggle_item = MagicMock()
             app.sync_now_item = MagicMock()
+            app.progress_item = MagicMock()
             return app
 
     def test_load_next_sync_time_none_when_not_in_config(self):
