@@ -127,7 +127,16 @@ class TestUpdateMenuStates:
         """Create a FolderSyncApp with mocked rumps to avoid GUI initialization."""
         from app import FolderSyncApp
 
-        with patch('app.rumps'), patch('app.is_launchd_installed', return_value=False), patch('app.load_config', return_value={'source': '/src', 'destination': '/dst', 'interval_minutes': 5, 'enabled': True, 'use_checksum': True}), patch('app.load_history', return_value=[]), patch('app.find_rclone', return_value='/usr/bin/rclone'):
+        with (
+            patch('app.rumps'),
+            patch('app.is_launchd_installed', return_value=False),
+            patch(
+                'app.load_config',
+                return_value={'source': '/src', 'destination': '/dst', 'interval_minutes': 5, 'enabled': True, 'use_checksum': True},
+            ),
+            patch('app.load_history', return_value=[]),
+            patch('app.find_rclone', return_value='/usr/bin/rclone'),
+        ):
             # Mock rumps.App.__init__
             with patch.object(FolderSyncApp, '__init__', lambda self: None):
                 app = FolderSyncApp()
@@ -424,7 +433,14 @@ class TestNextSyncTimePersistence:
 
         config_file = str(tmp_path / 'config.json')
         future = datetime(2026, 3, 7, 10, 30)
-        config = {'source': '/src', 'destination': '/dst', 'interval_minutes': 5, 'enabled': True, 'use_checksum': True, 'next_sync_time': future.isoformat()}
+        config = {
+            'source': '/src',
+            'destination': '/dst',
+            'interval_minutes': 5,
+            'enabled': True,
+            'use_checksum': True,
+            'next_sync_time': future.isoformat(),
+        }
         save_config(config, config_file)
 
         loaded = load_config(config_file)
@@ -477,7 +493,14 @@ class TestNextSyncTimePersistence:
 
         config_file = str(tmp_path / 'config.json')
         future = datetime(2026, 3, 7, 10, 30)
-        config = {'source': '/src', 'destination': '/dst', 'interval_minutes': 5, 'enabled': True, 'use_checksum': True, 'next_sync_time': future.isoformat()}
+        config = {
+            'source': '/src',
+            'destination': '/dst',
+            'interval_minutes': 5,
+            'enabled': True,
+            'use_checksum': True,
+            'next_sync_time': future.isoformat(),
+        }
         save_config(config, config_file)
 
         # Simulate quit: stop_event is set but config should still have next_sync_time
@@ -526,18 +549,29 @@ class TestNextSyncTimePersistence:
         assert not app._wake_event.is_set()
 
     def test_sync_now_starts_thread_when_no_loop(self):
-        """sync_now should start a standalone thread if no sync loop is running."""
+        """sync_now should restart the sync loop if no sync loop is running."""
         app = self._make_app()
         app.status = 'idle'
         app.sync_thread = None
         app._wake_event = threading.Event()
 
-        with patch('threading.Thread') as mock_thread:
-            mock_instance = MagicMock()
-            mock_thread.return_value = mock_instance
+        with patch('app.save_config'), patch.object(app, 'start_sync_loop') as mock_start:
             app.sync_now(None)
-            mock_thread.assert_called_once()
-            mock_instance.start.assert_called_once()
+            mock_start.assert_called_once()
+
+    def test_sync_now_sets_time_before_restarting_loop(self):
+        """sync_now should set next_sync_time to now before restarting the loop."""
+        app = self._make_app()
+        app.status = 'idle'
+        app.sync_thread = None
+        app._wake_event = threading.Event()
+        app._next_sync_time = datetime.now() + timedelta(hours=1)
+
+        with patch('app.save_config'), patch.object(app, 'start_sync_loop'):
+            app.sync_now(None)
+
+        delta = abs((app._next_sync_time - datetime.now()).total_seconds())
+        assert delta < 2
 
     def test_sync_now_enabled_in_menu_when_idle_with_loop(self):
         """Sync Now should be clickable when idle with an active sync loop."""
@@ -570,6 +604,68 @@ class TestNextSyncTimePersistence:
         result = app._wait_until_next_sync(300)
 
         assert result is True  # should sync (not stopped)
+
+    def test_sync_now_enabled_when_error_no_loop(self):
+        """Sync Now should be clickable in error state even without an active loop."""
+        app = self._make_app()
+        app.status = 'error'
+        app.last_error = 'NAS not mounted'
+        app.sync_thread = None  # loop died after error
+        app.config['enabled'] = True
+        app.update_menu()
+        app.sync_now_item.set_callback.assert_called_with(app.sync_now)
+
+    def test_run_sync_catches_unexpected_exception(self):
+        """_run_sync should catch unexpected exceptions, set error status, and log."""
+        app = self._make_app()
+        from sync import SyncProgress
+
+        app.progress = SyncProgress()
+        app._ui_dirty = False
+        app._rebuild_history = False
+
+        with (
+            patch('app.ensure_smb_mounts', side_effect=RuntimeError('boom')),
+            patch('app.logger') as mock_logger,
+        ):
+            app._run_sync()
+
+        assert app.status == 'error'
+        assert 'boom' in app.last_error
+        mock_logger.error.assert_called()
+
+    def test_run_sync_logs_start_and_result(self):
+        """_run_sync should log sync start and sync failure."""
+        from sync import SyncProgress, SyncResult
+
+        app = self._make_app()
+        app.progress = SyncProgress()
+        app._ui_dirty = False
+        app._rebuild_history = False
+
+        mock_result = SyncResult(
+            timestamp='Apr 07, 14:30',
+            success=False,
+            error='NAS not mounted',
+        )
+
+        with (
+            patch('app.ensure_smb_mounts', return_value=None),
+            patch('app.run_sync_live', return_value=mock_result),
+            patch('app.save_config'),
+            patch('app.add_history_entry'),
+            patch('app.logger') as mock_logger,
+        ):
+            app._run_sync()
+
+        assert app.status == 'error'
+        assert app.last_error == 'NAS not mounted'
+        # Should have logged start, attempt, and failure
+        log_messages = [call.args[0] for call in mock_logger.info.call_args_list]
+        assert any('Sync started' in msg for msg in log_messages)
+        assert any('Sync attempt' in msg for msg in log_messages)
+        error_messages = [call.args[0] for call in mock_logger.error.call_args_list]
+        assert any('Sync failed' in msg for msg in error_messages)
 
     def test_next_sync_time_survives_app_restart(self, tmp_path):
         """Full restart scenario: save time, reload config, verify time is there."""

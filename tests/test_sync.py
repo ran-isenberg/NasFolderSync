@@ -6,11 +6,17 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from sync import (
+    SMB_MOUNT_TIMEOUT,
     SyncProgress,
     SyncResult,
+    _is_smb_server_reachable,
+    _parse_smb_host,
+    _volume_mount_point,
     build_rclone_command,
+    ensure_smb_mounts,
     find_rclone,
     install_rclone,
+    mount_smb_share,
     parse_stats_line,
     run_sync,
     run_sync_live,
@@ -42,6 +48,208 @@ class TestValidatePaths:
     def test_both_missing_reports_source_first(self):
         error = validate_paths('/nonexistent/a', '/nonexistent/b')
         assert error == 'Google Drive not mounted'
+
+
+class TestVolumeMountPoint:
+    def test_volumes_path(self):
+        assert _volume_mount_point('/Volumes/NAS/Backup') == '/Volumes/NAS'
+
+    def test_volumes_root(self):
+        assert _volume_mount_point('/Volumes/NAS') == '/Volumes/NAS'
+
+    def test_non_volumes_path(self):
+        assert _volume_mount_point('/Users/me/Documents') is None
+
+    def test_short_path(self):
+        assert _volume_mount_point('/Volumes') is None
+
+
+class TestParseSmbHost:
+    def test_standard_url(self):
+        assert _parse_smb_host('smb://192.168.1.2/Share') == '192.168.1.2'
+
+    def test_url_with_user(self):
+        assert _parse_smb_host('smb://user@192.168.1.2/Share') == '192.168.1.2'
+
+    def test_url_with_port(self):
+        assert _parse_smb_host('smb://192.168.1.2:445/Share') == '192.168.1.2'
+
+    def test_hostname(self):
+        assert _parse_smb_host('smb://mynas.local/Share') == 'mynas.local'
+
+    def test_no_smb_prefix(self):
+        assert _parse_smb_host('http://host/share') is None
+
+    def test_empty_host(self):
+        assert _parse_smb_host('smb:///share') is None
+
+
+class TestSmbReachability:
+    def test_reachable_server(self):
+        with patch('sync.socket.create_connection') as mock_conn:
+            mock_conn.return_value.__enter__ = lambda s: s
+            mock_conn.return_value.__exit__ = lambda s, *a: None
+            assert _is_smb_server_reachable('192.168.1.2') is True
+
+    def test_unreachable_server(self):
+        with patch('sync.socket.create_connection', side_effect=OSError('refused')):
+            assert _is_smb_server_reachable('192.168.1.2') is False
+
+    def test_timeout(self):
+        with patch('sync.socket.create_connection', side_effect=TimeoutError):
+            assert _is_smb_server_reachable('192.168.1.2') is False
+
+
+class TestMountSmbShare:
+    def test_already_mounted(self):
+        with patch('sync.os.path.ismount', return_value=True):
+            assert mount_smb_share('smb://host/share', '/Volumes/share') is None
+
+    def test_mount_success(self):
+        call_count = 0
+
+        def ismount_side_effect(path):
+            nonlocal call_count
+            call_count += 1
+            return call_count > 2  # Not mounted initially, then mounted after polling
+
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        with (
+            patch('sync.os.path.ismount', side_effect=ismount_side_effect),
+            patch('sync._is_smb_server_reachable', return_value=True),
+            patch('sync.subprocess.run', return_value=mock_result) as mock_run,
+            patch('sync.time.sleep'),
+            patch('sync.time.monotonic', side_effect=[0, 1, 2]),
+        ):
+            assert mount_smb_share('smb://host/share', '/Volumes/share') is None
+            mock_run.assert_called_once_with(['open', 'smb://host/share'], capture_output=True, text=True, timeout=10, check=False)
+
+    def test_open_command_failure(self):
+        mock_result = MagicMock()
+        mock_result.returncode = 1
+        mock_result.stderr = 'connection refused'
+        with (
+            patch('sync.os.path.ismount', return_value=False),
+            patch('sync._is_smb_server_reachable', return_value=True),
+            patch('sync.subprocess.run', return_value=mock_result),
+        ):
+            error = mount_smb_share('smb://host/share', '/Volumes/share')
+            assert error is not None
+            assert 'exit 1' in error
+
+    def test_mount_timeout(self):
+        mock_result = MagicMock()
+        mock_result.returncode = 0
+        with (
+            patch('sync.os.path.ismount', return_value=False),
+            patch('sync._is_smb_server_reachable', return_value=True),
+            patch('sync.subprocess.run', return_value=mock_result),
+            patch('sync.time.sleep'),
+            patch('sync.time.monotonic', side_effect=[0] + [SMB_MOUNT_TIMEOUT + 1] * 2),
+        ):
+            error = mount_smb_share('smb://host/share', '/Volumes/share')
+            assert error is not None
+            assert 'did not appear' in error
+
+    def test_open_command_os_error(self):
+        with (
+            patch('sync.os.path.ismount', return_value=False),
+            patch('sync._is_smb_server_reachable', return_value=True),
+            patch('sync.subprocess.run', side_effect=OSError('fail')),
+        ):
+            error = mount_smb_share('smb://host/share', '/Volumes/share')
+            assert error is not None
+            assert 'error' in error
+
+    def test_open_command_timeout(self):
+        with (
+            patch('sync.os.path.ismount', return_value=False),
+            patch('sync._is_smb_server_reachable', return_value=True),
+            patch('sync.subprocess.run', side_effect=subprocess.TimeoutExpired(cmd='open', timeout=10)),
+        ):
+            error = mount_smb_share('smb://host/share', '/Volumes/share')
+            assert error is not None
+            assert 'timed out' in error
+
+    def test_unreachable_server_skips_open(self):
+        with (
+            patch('sync.os.path.ismount', return_value=False),
+            patch('sync._is_smb_server_reachable', return_value=False),
+            patch('sync.subprocess.run') as mock_run,
+        ):
+            error = mount_smb_share('smb://192.168.1.2/Share', '/Volumes/Share')
+            assert error is not None
+            assert 'not reachable' in error
+            mock_run.assert_not_called()
+
+
+class TestEnsureSmbMounts:
+    def test_disabled_returns_none(self):
+        config = {'auto_mount_smb': False, 'source_smb_url': 'smb://host/share', 'source': '/Volumes/share/data'}
+        assert ensure_smb_mounts(config) is None
+
+    def test_no_urls_returns_none(self):
+        config = {'auto_mount_smb': True, 'source_smb_url': '', 'destination_smb_url': '', 'source': '/src', 'destination': '/dst'}
+        assert ensure_smb_mounts(config) is None
+
+    def test_path_accessible_skips_mount(self):
+        config = {
+            'auto_mount_smb': True,
+            'source_smb_url': 'smb://host/share',
+            'source': '/Volumes/share/data',
+            'destination_smb_url': '',
+            'destination': '/dst',
+        }
+        with patch('sync.os.path.isdir', return_value=True):
+            assert ensure_smb_mounts(config) is None
+
+    def test_mount_attempted_on_inaccessible_path(self):
+        config = {
+            'auto_mount_smb': True,
+            'destination_smb_url': 'smb://192.168.1.2/NAS',
+            'destination': '/Volumes/NAS/Backup',
+            'source_smb_url': '',
+            'source': '/Users/me/Drive',
+        }
+        with (
+            patch('sync.os.path.isdir', return_value=False),
+            patch('sync.mount_smb_share', return_value=None) as mock_mount,
+        ):
+            assert ensure_smb_mounts(config) is None
+            mock_mount.assert_called_once_with('smb://192.168.1.2/NAS', '/Volumes/NAS')
+
+    def test_mount_failure_returns_error(self):
+        config = {
+            'auto_mount_smb': True,
+            'destination_smb_url': 'smb://192.168.1.2/NAS',
+            'destination': '/Volumes/NAS/Backup',
+            'source_smb_url': '',
+            'source': '/Users/me/Drive',
+        }
+        with (
+            patch('sync.os.path.isdir', return_value=False),
+            patch('sync.mount_smb_share', return_value='server not reachable'),
+        ):
+            result = ensure_smb_mounts(config)
+            assert result is not None
+            assert 'Destination SMB mount failed' in result
+            assert 'server not reachable' in result
+
+    def test_non_volumes_path_skipped(self):
+        config = {
+            'auto_mount_smb': True,
+            'source_smb_url': 'smb://host/share',
+            'source': '/Users/me/data',
+            'destination_smb_url': '',
+            'destination': '/dst',
+        }
+        with (
+            patch('sync.os.path.isdir', return_value=False),
+            patch('sync.mount_smb_share') as mock_mount,
+        ):
+            ensure_smb_mounts(config)
+            mock_mount.assert_not_called()
 
 
 class TestBuildRcloneCommand:
@@ -577,6 +785,95 @@ class TestTruncateLog:
         content = log.read_text()
         # Last line should be preserved
         assert 'line 99\n' in content
+
+
+class TestSyncLogging:
+    """Test that sync functions log key events."""
+
+    def test_run_sync_logs_path_validation_error(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.ERROR, logger='sync'):
+            run_sync('/nonexistent/src', '/nonexistent/dst')
+        assert any('Path validation failed' in r.message for r in caplog.records)
+
+    @patch('sync.subprocess.run')
+    def test_run_sync_logs_rclone_command(self, mock_run, tmp_path, caplog):
+        import logging
+
+        src = tmp_path / 'src'
+        dst = tmp_path / 'dst'
+        src.mkdir()
+        dst.mkdir()
+        mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=0, stdout='', stderr='')
+
+        with caplog.at_level(logging.INFO, logger='sync'):
+            run_sync(str(src), str(dst))
+        assert any('Running rclone' in r.message for r in caplog.records)
+
+    @patch('sync.subprocess.run')
+    def test_run_sync_logs_rclone_failure(self, mock_run, tmp_path, caplog):
+        import logging
+
+        src = tmp_path / 'src'
+        dst = tmp_path / 'dst'
+        src.mkdir()
+        dst.mkdir()
+        mock_run.return_value = subprocess.CompletedProcess(args=[], returncode=1, stdout='', stderr='some error')
+
+        with caplog.at_level(logging.ERROR, logger='sync'):
+            run_sync(str(src), str(dst))
+        assert any('rclone failed' in r.message for r in caplog.records)
+
+    def test_run_sync_live_logs_path_validation_error(self, caplog):
+        import logging
+
+        with caplog.at_level(logging.ERROR, logger='sync'):
+            result = run_sync_live('/nonexistent/src', '/nonexistent/dst')
+        assert not result.success
+        assert any('Path validation failed' in r.message for r in caplog.records)
+
+    @patch('sync.subprocess.Popen')
+    def test_run_sync_live_logs_success(self, mock_popen, tmp_path, caplog):
+        import logging
+
+        src = tmp_path / 'src'
+        dst = tmp_path / 'dst'
+        src.mkdir()
+        dst.mkdir()
+        log_file = str(tmp_path / 'test.log')
+
+        mock_proc = MagicMock()
+        mock_proc.stderr = iter([])
+        mock_proc.wait.return_value = None
+        mock_proc.returncode = 0
+        mock_popen.return_value = mock_proc
+
+        with caplog.at_level(logging.INFO, logger='sync'):
+            result = run_sync_live(str(src), str(dst), log_file=log_file)
+        assert result.success
+        assert any('rclone completed successfully' in r.message for r in caplog.records)
+
+    @patch('sync.subprocess.Popen')
+    def test_run_sync_live_logs_rclone_failure(self, mock_popen, tmp_path, caplog):
+        import logging
+
+        src = tmp_path / 'src'
+        dst = tmp_path / 'dst'
+        src.mkdir()
+        dst.mkdir()
+        log_file = str(tmp_path / 'test.log')
+
+        mock_proc = MagicMock()
+        mock_proc.stderr = iter(['error: something went wrong\n'])
+        mock_proc.wait.return_value = None
+        mock_proc.returncode = 1
+        mock_popen.return_value = mock_proc
+
+        with caplog.at_level(logging.ERROR, logger='sync'):
+            result = run_sync_live(str(src), str(dst), log_file=log_file)
+        assert not result.success
+        assert any('rclone failed' in r.message for r in caplog.records)
 
 
 class TestBuildVersionStamps:

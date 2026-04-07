@@ -1,11 +1,14 @@
 import json
+import logging
 import os
 import plistlib
 import re
 import shutil
+import socket
 import subprocess
 import sys
 import threading
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
@@ -33,6 +36,9 @@ DEFAULT_CONFIG = {
     'interval_minutes': 5,
     'enabled': True,
     'use_checksum': True,
+    'auto_mount_smb': False,
+    'source_smb_url': '',
+    'destination_smb_url': '',
 }
 
 # rclone --stats-one-line output patterns
@@ -156,7 +162,7 @@ def load_config(config_file: str = CONFIG_FILE) -> dict:
         try:
             with open(config_file) as f:
                 return {**DEFAULT_CONFIG, **json.load(f)}
-        except (json.JSONDecodeError, ValueError):
+        except json.JSONDecodeError, ValueError:
             pass  # Corrupt file — fall through to recreate with defaults
     # First launch or corrupt file — create the config file with defaults
     config = DEFAULT_CONFIG.copy()
@@ -238,7 +244,7 @@ def load_history(history_file: str = HISTORY_FILE) -> list[dict]:
         try:
             with open(history_file) as f:
                 return json.load(f)
-        except (json.JSONDecodeError, ValueError):
+        except json.JSONDecodeError, ValueError:
             pass  # Corrupt file — return empty
     return []
 
@@ -278,6 +284,125 @@ def truncate_log(log_file: str = LOG_FILE, max_bytes: int = MAX_LOG_BYTES) -> No
         tail = f.read()
     with open(log_file, 'wb') as f:
         f.write(tail)
+
+
+logger = logging.getLogger(__name__)
+
+SMB_MOUNT_TIMEOUT = 15  # seconds to wait for SMB share to appear after open command
+SMB_PORT = 445
+SMB_CONNECT_TIMEOUT = 3  # seconds to check if SMB server is reachable
+
+
+def _parse_smb_host(smb_url: str) -> str | None:
+    """Extract the hostname/IP from an SMB URL like 'smb://192.168.1.2/Share'."""
+    # Strip smb:// prefix
+    if smb_url.lower().startswith('smb://'):
+        rest = smb_url[6:]
+    else:
+        return None
+    # Host is everything before the first /
+    host = rest.split('/')[0]
+    # Strip optional user@ prefix
+    if '@' in host:
+        host = host.split('@', 1)[1]
+    # Strip optional :port suffix
+    if ':' in host:
+        host = host.split(':')[0]
+    return host or None
+
+
+def _is_smb_server_reachable(host: str) -> bool:
+    """Check if an SMB server is reachable via TCP connect to port 445."""
+    try:
+        with socket.create_connection((host, SMB_PORT), timeout=SMB_CONNECT_TIMEOUT):
+            return True
+    except OSError, TimeoutError:
+        return False
+
+
+def _volume_mount_point(path: str) -> str | None:
+    """Extract the /Volumes/<name> mount point from a path, or None if not under /Volumes/."""
+    if not path.startswith('/Volumes/'):
+        return None
+    parts = path.split('/')
+    if len(parts) >= 3:
+        return '/'.join(parts[:3])
+    return None
+
+
+def mount_smb_share(smb_url: str, mount_point: str) -> str | None:
+    """Mount an SMB share via 'open smb://...' (Finder creates mount point, uses Keychain).
+
+    Pre-checks server reachability to avoid Finder GUI error dialogs.
+    Returns None on success, or an error reason string on failure.
+    """
+    if os.path.ismount(mount_point):
+        return None
+
+    # Check if the server is reachable before invoking Finder
+    host = _parse_smb_host(smb_url)
+    if host and not _is_smb_server_reachable(host):
+        reason = f'server {host} is not reachable on port {SMB_PORT}'
+        logger.warning('SMB mount: %s', reason)
+        return reason
+
+    logger.info('Mounting SMB share: open %s (expecting mount at %s)', smb_url, mount_point)
+    try:
+        result = subprocess.run(['open', smb_url], capture_output=True, text=True, timeout=10, check=False)
+        if result.returncode != 0:
+            stderr = result.stderr.strip() if result.stderr else 'unknown error'
+            reason = f'open command failed (exit {result.returncode}): {stderr}'
+            logger.warning('SMB mount: %s', reason)
+            return reason
+    except subprocess.TimeoutExpired:
+        reason = 'open command timed out after 10s'
+        logger.warning('SMB mount: %s', reason)
+        return reason
+    except OSError as e:
+        reason = f'open command error: {e}'
+        logger.warning('SMB mount: %s', reason)
+        return reason
+
+    # Poll until the mount appears or we time out
+    deadline = time.monotonic() + SMB_MOUNT_TIMEOUT
+    while time.monotonic() < deadline:
+        if os.path.ismount(mount_point):
+            logger.info('SMB share mounted at %s', mount_point)
+            return None
+        time.sleep(1)
+
+    reason = f'mount did not appear at {mount_point} within {SMB_MOUNT_TIMEOUT}s'
+    logger.warning('SMB mount: %s', reason)
+    return reason
+
+
+def ensure_smb_mounts(config: dict) -> str | None:
+    """Attempt to mount SMB shares for source/destination if auto_mount_smb is enabled.
+
+    Returns an error message if a required share could not be mounted, None if OK.
+    """
+    if not config.get('auto_mount_smb', False):
+        return None
+
+    failures = []
+    for path_key, url_key, label in [
+        ('source', 'source_smb_url', 'Source'),
+        ('destination', 'destination_smb_url', 'Destination'),
+    ]:
+        smb_url = config.get(url_key, '').strip()
+        if not smb_url:
+            continue
+        path = config.get(path_key, '')
+        mount_point = _volume_mount_point(path)
+        if mount_point is None:
+            continue
+        if os.path.isdir(path):
+            continue
+        mount_error = mount_smb_share(smb_url, mount_point)
+        if mount_error:
+            failures.append(f'{label} SMB mount failed ({smb_url}): {mount_error}')
+
+    return '; '.join(failures) if failures else None
 
 
 def validate_paths(source: str, destination: str) -> str | None:
@@ -324,7 +449,7 @@ def install_rclone() -> str | None:
             result = subprocess.run([brew, 'install', 'rclone'], capture_output=True, text=True, timeout=300, check=False)
             if result.returncode == 0:
                 return find_rclone()
-        except (subprocess.TimeoutExpired, OSError):
+        except subprocess.TimeoutExpired, OSError:
             pass
 
     return None
@@ -362,9 +487,11 @@ def run_sync(source: str, destination: str, log_file: str | None = None, use_che
     """Run rclone sync (blocking, no progress). Returns (success, error_message, timestamp)."""
     path_error = validate_paths(source, destination)
     if path_error:
+        logger.error('Path validation failed: %s', path_error)
         return False, path_error, None
 
     cmd = build_rclone_command(source, destination, log_file, use_checksum=use_checksum)
+    logger.info('Running rclone: %s', ' '.join(cmd))
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600, check=False)
@@ -373,12 +500,16 @@ def run_sync(source: str, destination: str, log_file: str | None = None, use_che
             return True, None, timestamp
         else:
             error = result.stderr.strip().split('\n')[-1][:80] if result.stderr else 'rclone error'
+            logger.error('rclone failed (exit %d): %s', result.returncode, error)
             return False, error, None
     except FileNotFoundError:
+        logger.error('rclone binary not found')
         return False, 'rclone not found — run: brew install rclone', None
     except subprocess.TimeoutExpired:
+        logger.error('Sync timed out after 3600s')
         return False, 'Sync timed out', None
     except Exception as e:
+        logger.error('Unexpected sync error: %s', e)
         return False, str(e)[:80], None
 
 
@@ -394,6 +525,7 @@ def run_sync_live(
     """Run rclone sync with real-time progress updates via callback."""
     path_error = validate_paths(source, destination)
     if path_error:
+        logger.error('Path validation failed: %s', path_error)
         return SyncResult(
             timestamp=datetime.now().strftime('%b %d, %H:%M'),
             success=False,
@@ -404,6 +536,7 @@ def run_sync_live(
         log_file = os.path.expanduser('~/foldersync.log')
     truncate_log(log_file)
     cmd = build_rclone_command(source, destination, log_file, use_checksum=use_checksum, live=True)
+    logger.info('Running rclone: %s', ' '.join(cmd))
     progress = SyncProgress()
     start_time = datetime.now()
     cancelled = False
@@ -447,6 +580,7 @@ def run_sync_live(
         duration = int((datetime.now() - start_time).total_seconds())
 
         if cancelled:
+            logger.info('Sync cancelled by user after %ds', duration)
             return SyncResult(
                 timestamp=datetime.now().strftime('%b %d, %H:%M'),
                 success=False,
@@ -455,6 +589,7 @@ def run_sync_live(
             )
 
         if proc.returncode == 0:
+            logger.info('rclone completed successfully in %ds — %d files, %s', duration, progress.files_done, progress.bytes_transferred or '0 B')
             return SyncResult(
                 timestamp=datetime.now().strftime('%b %d, %H:%M'),
                 success=True,
@@ -465,6 +600,7 @@ def run_sync_live(
         else:
             all_stderr = ''.join(stderr_lines)
             last_line = all_stderr.strip().split('\n')[-1][:80] if all_stderr.strip() else 'rclone error'
+            logger.error('rclone failed (exit %d) after %ds: %s', proc.returncode, duration, last_line)
             return SyncResult(
                 timestamp=datetime.now().strftime('%b %d, %H:%M'),
                 success=False,
@@ -474,12 +610,14 @@ def run_sync_live(
                 duration_seconds=duration,
             )
     except FileNotFoundError:
+        logger.error('rclone binary not found')
         return SyncResult(
             timestamp=datetime.now().strftime('%b %d, %H:%M'),
             success=False,
             error='rclone not found — run: brew install rclone',
         )
     except Exception as e:
+        logger.error('Unexpected sync error: %s', e)
         return SyncResult(
             timestamp=datetime.now().strftime('%b %d, %H:%M'),
             success=False,
