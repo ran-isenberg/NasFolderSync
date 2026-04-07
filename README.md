@@ -14,6 +14,7 @@ A macOS menu bar wrapper around [rclone](https://rclone.org/) that automatically
 - **Pause / Resume** without quitting
 - **Sync Now** for instant manual sync
 - **In-app configuration** — set source, destination, and interval from the menu
+- **Auto-mount SMB shares** — automatically reconnects NAS shares when WiFi drops; uses Keychain credentials
 - **Clean uninstall** — removes app, config, history, and logs; never touches your data folders
 - **Logs** viewable via Console.app
 
@@ -103,7 +104,7 @@ gdrive-nas-sync/
 - macOS 13+ (Ventura or later)
 - [Homebrew](https://brew.sh)
 - Google Drive for Desktop running (mounts at `/Volumes/Google Drive`)
-- NAS mounted via SMB (Finder → Go → Connect to Server → `smb://NAS_IP/share`)
+- NAS accessible via SMB (auto-mount or manual: Finder → Go → Connect to Server)
 
 ---
 
@@ -167,8 +168,45 @@ Click the menu bar icon → **Configure** to set:
 | **Source** | Path to your Google Drive mount (opens folder picker) | `/Volumes/Google Drive/My Drive` |
 | **Destination** | Path to your NAS mount (opens folder picker) | `/Volumes/NAS` |
 | **Interval** | Minutes between syncs | `5` |
+| **Auto Mount SMB** | Automatically mount SMB shares before syncing | `off` |
+| **Source SMB URL** | SMB URL for the source share (if under `/Volumes/`) | — |
+| **Dest SMB URL** | SMB URL for the destination share (if under `/Volumes/`) | — |
 
 Config is stored at `~/.foldersync.json`.
+
+### Auto-mount SMB shares
+
+If your NAS disconnects due to WiFi drops or sleep, FolderSync can automatically remount it before each sync. Enable **Auto Mount SMB** in the Configure dialog and set the SMB URL for your source or destination.
+
+**SMB URL format:**
+
+```
+smb://username@server-ip/share-name
+```
+
+**Important:** Include the username in the URL so macOS can match the Keychain entry and connect without a password prompt. For example:
+
+```
+smb://myuser@192.168.1.2/
+```
+
+**Setting up Keychain credentials (one-time):**
+
+1. Open Finder → Go → Connect to Server
+2. Enter `smb://username@server-ip/share-name`
+3. Enter the password and check **"Remember this password in my keychain"**
+4. The share mounts — you can disconnect after saving
+
+From now on, FolderSync will use the saved Keychain credentials to remount the share silently whenever it drops.
+
+**How it works:**
+
+1. Before each sync, FolderSync checks if the source/destination paths are accessible
+2. If a path under `/Volumes/` is missing and an SMB URL is configured, it attempts to mount:
+   - First checks if the server is reachable (TCP port 445) — if not, fails immediately with no GUI popup
+   - If reachable, runs `open smb://...` which uses Finder to mount with Keychain credentials
+   - Waits up to 15 seconds for the mount to appear
+3. If the mount fails, the error is logged to `~/foldersync.log` and shown in the menu bar status
 
 ---
 
@@ -218,8 +256,11 @@ make uninstall
 
 | Issue | Fix |
 |-------|-----|
-| ⚠️ "Google Drive not mounted" | Make sure Google Drive for Desktop is running |
-| ⚠️ "NAS not mounted" | Reconnect via Finder → Go → Connect to Server |
-| ⚠️ "rclone not found" | Run `brew install rclone` in Terminal |
+| "Google Drive not mounted" | Make sure Google Drive for Desktop is running |
+| "NAS not mounted" | Enable Auto Mount SMB in Configure, or reconnect via Finder → Go → Connect to Server |
+| "server not reachable on port 445" | NAS is offline or unreachable — check network/power |
+| "mount did not appear within 15s" | Keychain credentials may be missing — see [Auto-mount SMB shares](#auto-mount-smb-shares) |
+| SMB mount prompts for password | Add the username to the SMB URL: `smb://username@host/share` |
+| "rclone not found" | Run `brew install rclone` in Terminal |
 | App doesn't appear | Check `/Applications/FolderSync.app` exists, try opening manually |
 | Sync is slow | Check network speed; adjust `--transfers` and `--checkers` in `sync.py` |

@@ -334,6 +334,8 @@ def mount_smb_share(smb_url: str, mount_point: str) -> str | None:
     """Mount an SMB share via 'open smb://...' (Finder creates mount point, uses Keychain).
 
     Pre-checks server reachability to avoid Finder GUI error dialogs.
+    Include the username in the SMB URL (e.g. smb://user@host/share) so Finder
+    matches the Keychain entry and connects without a password prompt.
     Returns None on success, or an error reason string on failure.
     """
     if os.path.ismount(mount_point):
