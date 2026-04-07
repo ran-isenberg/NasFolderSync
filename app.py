@@ -1,3 +1,4 @@
+import logging
 import os
 import signal
 import subprocess
@@ -7,6 +8,7 @@ from datetime import datetime, timedelta
 import objc
 import rumps
 from AppKit import (
+    NSURL,
     NSApp,
     NSBackingStoreBuffered,
     NSBezelStyleRounded,
@@ -17,7 +19,6 @@ from AppKit import (
     NSOpenPanel,
     NSTextField,
     NSTitledWindowMask,
-    NSURL,
     NSWindow,
 )
 
@@ -28,8 +29,10 @@ from sync import (
     APP_SPONSOR,
     APP_VERSION,
     APP_WEBSITE,
+    LOG_FILE,
     SyncProgress,
     add_history_entry,
+    ensure_smb_mounts,
     find_rclone,
     install_launchd_plist,
     install_rclone,
@@ -41,6 +44,20 @@ from sync import (
     uninstall_app,
     uninstall_launchd_plist,
 )
+
+logger = logging.getLogger('foldersync')
+
+
+def _setup_logging():
+    """Configure logging to write to the same log file as rclone output."""
+    handler = logging.FileHandler(LOG_FILE)
+    handler.setFormatter(logging.Formatter('%(asctime)s %(levelname)-7s %(message)s', datefmt='%Y/%m/%d %H:%M:%S'))
+    root = logging.getLogger('foldersync')
+    root.setLevel(logging.INFO)
+    root.addHandler(handler)
+    # Also configure sync module's logger to use the same handler
+    logging.getLogger('sync').addHandler(handler)
+    logging.getLogger('sync').setLevel(logging.INFO)
 
 
 def _pick_folder(title: str, start_path: str | None = None) -> str | None:
@@ -96,7 +113,7 @@ class _ConfigWindow:
     """Native macOS preferences window for FolderSync configuration."""
 
     WIDTH = 500
-    HEIGHT = 280
+    HEIGHT = 420
 
     def __init__(self, app):
         self.app = app
@@ -144,6 +161,27 @@ class _ConfigWindow:
         self.autostart_switch.setTitle_('')
         self.autostart_switch.setState_(1 if is_launchd_installed() else 0)
         content.addSubview_(self.autostart_switch)
+        y -= 40
+
+        # Auto-mount SMB
+        self._add_label(content, 'Auto-mount SMB:', 20, y, label_font)
+        self.smb_switch = NSButton.alloc().initWithFrame_(NSMakeRect(140, y - 2, 100, 24))
+        self.smb_switch.setButtonType_(3)  # NSSwitchButton
+        self.smb_switch.setTitle_('')
+        self.smb_switch.setState_(1 if self.app.config.get('auto_mount_smb', False) else 0)
+        content.addSubview_(self.smb_switch)
+        y -= 35
+
+        # Source SMB URL
+        self._add_label(content, 'Source SMB URL:', 20, y, NSFont.systemFontOfSize_(13))
+        self.source_smb_field = self._add_text_field(content, self.app.config.get('source_smb_url', ''), 140, y, 340)
+        self.source_smb_field.setPlaceholderString_('smb://192.168.1.2/ShareName')
+        y -= 30
+
+        # Destination SMB URL
+        self._add_label(content, 'Dest SMB URL:', 20, y, NSFont.systemFontOfSize_(13))
+        self.dest_smb_field = self._add_text_field(content, self.app.config.get('destination_smb_url', ''), 140, y, 340)
+        self.dest_smb_field.setPlaceholderString_('smb://192.168.1.2/ShareName')
         y -= 50
 
         # Save / Cancel buttons
@@ -200,14 +238,20 @@ class _ConfigWindow:
             rumps.notification('FolderSync', 'Error', 'Please enter a valid number for interval.', sound=False)
             return
         autostart = bool(self.autostart_switch.state())
+        smb_settings = {
+            'auto_mount_smb': bool(self.smb_switch.state()),
+            'source_smb_url': str(self.source_smb_field.stringValue()).strip(),
+            'destination_smb_url': str(self.dest_smb_field.stringValue()).strip(),
+        }
         self.window.close()
         self.app._config_window = None
-        self.app._apply_config(source, destination, interval, autostart)
+        self.app._apply_config(source, destination, interval, autostart, smb_settings)
 
 
 class FolderSyncApp(rumps.App):
     def __init__(self):
         super().__init__('FolderSync', quit_button=None)
+        _setup_logging()
         self.config = load_config()
 
         self.status = 'idle'
@@ -344,7 +388,6 @@ class FolderSyncApp(rumps.App):
             self.next_sync_item.title = 'Next sync: —'
 
         # Toggle button state
-        has_active_loop = self.sync_thread is not None and self.sync_thread.is_alive()
         is_paused = not self.config['enabled']
 
         if is_paused:
@@ -358,8 +401,8 @@ class FolderSyncApp(rumps.App):
             self.toggle_item.title = 'Pause Sync'
             self.toggle_item.set_callback(None)
 
-        # Sync Now only available when idle with an active loop (not paused, not syncing)
-        if is_paused or self.status == 'syncing' or not has_active_loop:
+        # Sync Now available when not paused and not currently syncing
+        if is_paused or self.status == 'syncing':
             self.sync_now_item.set_callback(None)
         else:
             self.sync_now_item.set_callback(self.sync_now)
@@ -509,7 +552,7 @@ class FolderSyncApp(rumps.App):
         if raw:
             try:
                 return datetime.fromisoformat(raw)
-            except (ValueError, TypeError):
+            except ValueError, TypeError:
                 pass
         return None
 
@@ -524,7 +567,7 @@ class FolderSyncApp(rumps.App):
         if raw:
             try:
                 return datetime.fromisoformat(raw)
-            except (ValueError, TypeError):
+            except ValueError, TypeError:
                 pass
         return None
 
@@ -584,9 +627,28 @@ class FolderSyncApp(rumps.App):
                 self._run_sync()
 
     def _run_sync(self):
+        try:
+            self._run_sync_inner()
+        except Exception as e:
+            logger.error('Unexpected error in sync: %s', e, exc_info=True)
+            self.status = 'error'
+            self.last_error = str(e)[:80]
+            self._sync_end_time = datetime.now()
+            self._mark_ui_dirty()
+
+    def _run_sync_inner(self):
         max_retries = 3
         retry_delay = 30
         non_retryable = {'Google Drive not mounted', 'NAS not mounted', 'rclone not found — run: brew install rclone', 'Sync cancelled'}
+
+        logger.info('Sync started: %s -> %s', self.config['source'], self.config['destination'])
+
+        # Attempt to mount SMB shares before syncing
+        smb_error = ensure_smb_mounts(self.config)
+        if smb_error:
+            logger.error('SMB mount failed: %s', smb_error)
+            rumps.notification('FolderSync', 'SMB mount failed', smb_error, sound=False)
+            non_retryable.add(smb_error)
 
         for attempt in range(1, max_retries + 1):
             self._sync_start_time = datetime.now()
@@ -599,6 +661,7 @@ class FolderSyncApp(rumps.App):
                 self.progress = progress
                 self._mark_ui_dirty()
 
+            logger.info('Sync attempt %d/%d', attempt, max_retries)
             result = run_sync_live(
                 self.config['source'],
                 self.config['destination'],
@@ -610,19 +673,23 @@ class FolderSyncApp(rumps.App):
             self._rclone_proc = None
 
             if result.success:
+                logger.info('Sync completed: %s, %d files, %s', result.timestamp, result.files_transferred, result.bytes_transferred or '0 B')
                 self.status = 'idle'
                 self.last_error = None
                 self.last_sync = result.timestamp
                 break
             elif self.status == 'paused' or self.stop_event.is_set():
+                logger.info('Sync cancelled by user')
                 # Cancelled by pause/quit — don't overwrite paused status with error
                 break
             elif result.error in non_retryable or attempt == max_retries:
+                logger.error('Sync failed: %s', result.error)
                 self.status = 'error'
                 self.last_error = result.error
                 break
             else:
                 # Transient error — retry after delay
+                logger.warning('Sync error (attempt %d/%d): %s — retrying in %ds', attempt, max_retries, result.error, retry_delay)
                 self.status = 'error'
                 self.last_error = f'{result.error} (retry {attempt}/{max_retries})'
                 self._mark_ui_dirty()
@@ -678,11 +745,12 @@ class FolderSyncApp(rumps.App):
             return
         # Set next_sync_time to now so the sync loop treats it as overdue,
         # then wake the loop. _poll_ui's wake-from-sleep check also catches this.
+        self._save_next_sync_time(datetime.now())
         if self.sync_thread and self.sync_thread.is_alive():
-            self._save_next_sync_time(datetime.now())
             self._wake_event.set()
         else:
-            threading.Thread(target=self._run_sync, daemon=True).start()
+            # Sync loop died (e.g. after error) — restart it
+            self.start_sync_loop()
 
     def open_configure(self, _):
         """Open the native preferences window."""
@@ -692,18 +760,18 @@ class FolderSyncApp(rumps.App):
             return
         self._config_window = _ConfigWindow(self)
 
-    def _apply_config(self, source, destination, interval_minutes, autostart):
+    def _apply_config(self, source, destination, interval_minutes, autostart, smb_settings=None):
         """Called by the config window when Save is clicked."""
         changed = False
-        if source != self.config['source']:
-            self.config['source'] = source
-            changed = True
-        if destination != self.config['destination']:
-            self.config['destination'] = destination
-            changed = True
-        if interval_minutes != self.config['interval_minutes']:
-            self.config['interval_minutes'] = interval_minutes
-            changed = True
+        for key, new_val in [('source', source), ('destination', destination), ('interval_minutes', interval_minutes)]:
+            if new_val != self.config[key]:
+                self.config[key] = new_val
+                changed = True
+        for key in ('auto_mount_smb', 'source_smb_url', 'destination_smb_url'):
+            new_val = (smb_settings or {}).get(key)
+            if new_val is not None and new_val != self.config.get(key):
+                self.config[key] = new_val
+                changed = True
         if changed:
             save_config(self.config)
             self._wake_event.set()

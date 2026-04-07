@@ -54,7 +54,8 @@ def test_load_config_overrides_all_defaults(tmp_path):
         json.dump(custom, f)
 
     config = load_config(config_file)
-    assert config == custom
+    for key, value in custom.items():
+        assert config[key] == value
 
 
 def test_save_config_writes_valid_json(tmp_path):
@@ -72,4 +73,5 @@ def test_save_and_load_roundtrip(tmp_path):
     config = {'source': '/my/src', 'destination': '/my/dst', 'interval_minutes': 15, 'enabled': False, 'use_checksum': True}
     save_config(config, config_file)
     loaded = load_config(config_file)
-    assert loaded == config
+    for key, value in config.items():
+        assert loaded[key] == value

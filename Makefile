@@ -14,7 +14,7 @@ fmt:
 test:
 	uv run pytest -v
 
-build:
+build: lint test
 	./build.sh
 
 deploy:
